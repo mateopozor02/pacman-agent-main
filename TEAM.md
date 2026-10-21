@@ -1,18 +1,20 @@
 # Team Information
 
-**Course:** _[fill your course code and name]_
+**Course:** _Autnonomoues Systems_
 
-**Semester:** Semester 2, 2020
+**Semester:** Semester 1, Winter term 2026 UPF
 
-**Instructor:** _[name of your instructor]_
+**Instructor:** _Javier Segovia-Aguas_
 
-**Team name:** _[replace this with team name in plan text]_
+**Team name:** _MoNiCa_
 
 **Team members:**
 
 * Student 1's Student number - Full Name - Student email - Student Github id
-* Student 2's Student number - Full Name - Student email - Student Github id
-* Student 3's Student number - Full Name - Student email - Student Github id
+
+* U283349 - Caspar Schlageter -caspar.schlageter01@estudiant.upf.edu - TLCasparS
+* Mateo Pozo - - mateopozor02
+* Nikita B
 
 Replace the lines above with the correct details of members. Delete or add lines as needed.
 
