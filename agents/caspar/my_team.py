@@ -24,13 +24,15 @@ from contest.util import nearest_point
 
 # Seconds MCTS may think per move. The game warns at 1 s (3rd warning = loss).
 # Measured: a whole move takes up to ~0.2 s longer than the budget (state copy,
-# freeing the tree), so 0.5 keeps moves under ~0.7 s.
+# freeing the tree), so 0.5 keeps moves under ~0.7 s. The limit is per agent,
+# so attacker and defender can both use the full budget.
 # For quick local tests: MCTS_BUDGET=0.1 python capture.py ...
-MCTS_BUDGET = float(os.environ.get('MCTS_BUDGET', 0.5))
+MCTS_BUDGET = float(os.environ.get('MCTS_BUDGET', 0.2))
 ROLLOUT_DEPTH = 12        # simulated moves per rollout before evaluating
-UCB_C = 1.0               # exploration constant (rewards are roughly in [-1, 3])
-GREEDY_PROB = 0.7         # rollout policy: chance to step towards the target instead of randomly
-RETURN_AFTER = 4          # rollout policy: head home once carrying this many dots
+UCB_C = 1.0               # exploration constant (rewards are roughly in [-3, 3])
+GREEDY_PROB = 0.5         # rollout policy: chance to step towards the target instead of randomly
+RETURN_AFTER = 4          # rollout policy / invader model: head home once carrying this many dots
+FLEE_DIST = 3             # invader model: run when the (not scared) defender is this close
 
 
 #################
@@ -38,7 +40,7 @@ RETURN_AFTER = 4          # rollout policy: head home once carrying this many do
 #################
 
 def create_team(first_index, second_index, is_red,
-                first='MCTSOffensiveAgent', second='DefensiveReflexAgent', num_training=0):
+                first='MCTSOffensiveAgent', second='MCTSDefensiveAgent', num_training=0):
     """
     This function should return a list of two agents that will form the
     team, initialized using firstIndex and secondIndex as their agent
@@ -56,28 +58,83 @@ def create_team(first_index, second_index, is_red,
     return [eval(first)(first_index), eval(second)(second_index)]
 
 
-########
-# MCTS #
-########
+#########
+# World #
+#########
 
 class World:
     """What never changes during a game. Built once in register_initial_state,
     shared by every simulated state (the reflex agent doesn't need this)."""
 
-    def __init__(self, neighbours, border, is_red, mid_x, distances, home_dist):
-        self.neighbours = neighbours   # dict: (x, y) -> list of free cells you can step to
-        self.border = border           # cells on your side of the middle line
+    def __init__(self, neighbours, is_red, mid_x, distances, home_dist, enemy_home_dist):
+        self.neighbours = neighbours            # dict: (x, y) -> list of free cells you can step to
         self.is_red = is_red
         self.mid_x = mid_x
-        self.distances = distances     # dict: ((x1, y1), (x2, y2)) -> maze distance
-        self.home_dist = home_dist     # dict: (x, y) -> maze distance to the nearest border cell
+        self.distances = distances              # dict: ((x1, y1), (x2, y2)) -> maze distance
+        self.home_dist = home_dist              # dict: (x, y) -> maze distance to OUR nearest border cell
+        self.enemy_home_dist = enemy_home_dist  # dict: (x, y) -> maze distance to THEIR nearest border cell
+
+        # defender moves: neighbours that stay on our side, plus waiting in place
+        self.guard_moves = {cell: [c for c in cells if self.on_my_side(c)] + [cell]
+                            for cell, cells in neighbours.items()}
 
     def distance(self, a, b):
         return self.distances[(a, b)]
 
+    def on_my_side(self, pos):
+        if self.is_red:
+            return pos[0] < self.mid_x
+        return pos[0] >= self.mid_x
 
-class SimState:
-    """Snapshot of the simulated game: only what changes from move to move."""
+
+def build_world(agent, game_state):
+    """Shared by both MCTS agents; called from register_initial_state."""
+    walls = game_state.get_walls()
+    mid_x = walls.width // 2
+
+    # neighbours of every free cell (N/S/E/W, no Stop)
+    neighbours = {}
+    for x in range(walls.width):
+        for y in range(walls.height):
+            if walls[x][y]:
+                continue
+            cells = []
+            for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < walls.width and 0 <= ny < walls.height and not walls[nx][ny]:
+                    cells.append((nx, ny))
+            neighbours[(x, y)] = cells
+
+    # the column on each side of the middle line
+    border_x = mid_x - 1 if agent.red else mid_x
+    enemy_border_x = mid_x if agent.red else mid_x - 1
+    border = [(border_x, y) for y in range(walls.height) if not walls[border_x][y]]
+    enemy_border = [(enemy_border_x, y) for y in range(walls.height) if not walls[enemy_border_x][y]]
+
+    # distance from every cell to the nearest border cell (used every evaluate)
+    home_dist = {cell: min(agent.get_maze_distance(cell, b) for b in border)
+                 for cell in neighbours}
+    enemy_home_dist = {cell: min(agent.get_maze_distance(cell, b) for b in enemy_border)
+                       for cell in neighbours}
+
+    return World(neighbours, agent.red, mid_x, agent.distancer._distances, home_dist, enemy_home_dist)
+
+
+def direction_to(src, dst):
+    """Action that moves from cell src to the neighbouring cell dst (STOP if equal)."""
+    return Actions.vector_to_direction((dst[0] - src[0], dst[1] - src[1]))
+
+
+########
+# MCTS #
+########
+#
+# mcts_search works with any state that has legal_moves(), step(move),
+# is_terminal(), rollout_move() and evaluate(). AttackState and DefenseState
+# both provide them.
+
+class AttackState:
+    """Simulated game for the attacker: I move, then the visible ghosts chase me."""
 
     def __init__(self, world, my_pos, ghosts, food, carrying, returned=0, dead=False):
         self.world = world         # shared, not copied
@@ -89,7 +146,7 @@ class SimState:
         self.dead = dead
 
     def copy(self):
-        return SimState(
+        return AttackState(
             world=self.world,          # shared
             my_pos=self.my_pos,
             ghosts=list(self.ghosts),  # own copy
@@ -103,9 +160,7 @@ class SimState:
         return self.world.neighbours[self.my_pos]
 
     def on_my_side(self, pos):
-        if self.world.is_red:
-            return pos[0] < self.world.mid_x
-        return pos[0] >= self.world.mid_x
+        return self.world.on_my_side(pos)
 
     def is_terminal(self):
         return self.dead or len(self.food) == 0
@@ -155,47 +210,159 @@ class SimState:
 
         return new
 
+    def evaluate(self):
+        """How good is this simulated state for my attacker? Roughly in [-1, 3]."""
+        if self.dead:
+            return -1.0
 
-def evaluate(state):
-    """How good is this simulated state for my attacker? Roughly in [-1, 3]."""
-    if state.dead:
-        return -1.0
+        world = self.world
+        value = 1.0 * self.returned + 0.6 * self.carrying   # carried food is still at risk
 
-    world = state.world
-    value = 1.0 * state.returned + 0.6 * state.carrying   # carried food is still at risk
+        # pull towards the nearest food
+        if self.food:
+            nearest_food = min(world.distance(self.my_pos, f) for f in self.food)
+            value -= 0.02 * nearest_food
 
-    # pull towards the nearest food
-    if state.food:
-        nearest_food = min(world.distance(state.my_pos, f) for f in state.food)
-        value -= 0.02 * nearest_food
+        # the more I carry, the more being far from home costs
+        if self.carrying > 0:
+            value -= 0.01 * self.carrying * world.home_dist[self.my_pos]
 
-    # the more I carry, the more being far from home costs
-    if state.carrying > 0:
-        value -= 0.01 * state.carrying * world.home_dist[state.my_pos]
+        return value
 
-    return value
+    def rollout_move(self):
+        """Cheap rollout policy: usually step towards the target, sometimes randomly."""
+        moves = self.legal_moves()
+        if random.random() > GREEDY_PROB:
+            return random.choice(moves)
+
+        world = self.world
+        if self.carrying >= RETURN_AFTER or not self.food:
+            return min(moves, key=lambda c: world.home_dist[c])
+        target = min(self.food, key=lambda f: world.distance(self.my_pos, f))
+        return min(moves, key=lambda c: world.distance(c, target))
 
 
-def rollout_move(state):
-    """Cheap rollout policy: usually step towards the target, sometimes randomly."""
-    moves = state.legal_moves()
-    if random.random() > GREEDY_PROB:
-        return random.choice(moves)
+class DefenseState:
+    """Simulated game for the defender: I move (staying on our side), then every
+    visible invader (enemy Pacman on our side) moves with a simple model."""
 
-    world = state.world
-    if state.carrying >= RETURN_AFTER or not state.food:
-        return min(moves, key=lambda c: world.home_dist[c])
-    target = min(state.food, key=lambda f: world.distance(state.my_pos, f))
-    return min(moves, key=lambda c: world.distance(c, target))
+    def __init__(self, world, my_pos, invaders, food, scared,
+                 caught=0, eaten=0, escaped=0, dead=False):
+        self.world = world         # shared, not copied
+        self.my_pos = my_pos       # (x, y)
+        self.invaders = invaders   # list of (pos, carrying)
+        self.food = food           # set of our dots still on the board
+        self.scared = scared       # moves left that I'm scared: touching an invader then kills ME
+        self.caught = caught       # invaders caught during this simulation
+        self.eaten = eaten         # our dots eaten (minus dots dropped back by caught invaders)
+        self.escaped = escaped     # dots invaders carried home (= points for them)
+        self.dead = dead
+
+    def copy(self):
+        return DefenseState(self.world, self.my_pos, list(self.invaders), set(self.food), self.scared,
+                            self.caught, self.eaten, self.escaped, self.dead)
+
+    def legal_moves(self):
+        return self.world.guard_moves[self.my_pos]
+
+    def is_terminal(self):
+        return self.dead or not self.invaders
+
+    def step(self, move):
+        """One simulated turn: I move to `move` (a cell), then every invader moves."""
+        new = self.copy()
+        new.my_pos = move
+
+        # I walked into an invader? (capture.py checks this before counting down my scared timer)
+        new.collide()
+        if new.dead:
+            return new
+        new.scared = max(0, new.scared - 1)
+
+        # invaders move
+        moved = []
+        for pos, carrying in new.invaders:
+            pos = new.invader_move(pos, carrying)
+            if not new.world.on_my_side(pos):   # made it home: what it carried is scored
+                new.escaped += carrying
+                continue
+            if pos in new.food:
+                new.food.remove(pos)
+                carrying += 1
+                new.eaten += 1
+            moved.append((pos, carrying))
+        new.invaders = moved
+
+        # an invader walked into me?
+        new.collide()
+        return new
+
+    def collide(self):
+        """Resolve invaders standing on my cell."""
+        remaining = []
+        for pos, carrying in self.invaders:
+            if pos != self.my_pos:
+                remaining.append((pos, carrying))
+            elif self.scared:
+                self.dead = True                # scared ghost touched a Pacman: I respawn
+                remaining.append((pos, carrying))
+            else:
+                self.caught += 1
+                self.eaten -= carrying          # the dots it carried are dropped back on our side
+        self.invaders = remaining
+
+    def invader_move(self, pos, carrying):
+        """Opponent model: eat me if I'm scared and next to it, run if I'm close,
+        go home when carrying enough, otherwise walk to the nearest dot."""
+        world = self.world
+        options = world.neighbours[pos]
+        me = self.my_pos
+
+        if self.scared and me in options:
+            return me
+        if not self.scared and world.distance(pos, me) <= FLEE_DIST:
+            return max(options, key=lambda c: world.distance(c, me) - 0.5 * world.enemy_home_dist[c])
+        if carrying >= RETURN_AFTER or not self.food:
+            return min(options, key=lambda c: world.enemy_home_dist[c])
+        target = min(self.food, key=lambda f: world.distance(pos, f))
+        return min(options, key=lambda c: world.distance(c, target))
+
+    def evaluate(self):
+        """How good is this simulated state for my defender? Roughly in [-3, 3]."""
+        value = 1.0 * self.caught - 0.3 * self.eaten - 1.0 * self.escaped
+        if self.dead:
+            # Dying ends the simulation, so the dots eaten while I walk back from my
+            # start are never counted. Make it clearly worse than any outcome where I
+            # stay alive, otherwise MCTS learns that dying is the cheap option.
+            return value - 10.0
+
+        if self.invaders:
+            nearest = min(self.world.distance(self.my_pos, p) for p, _ in self.invaders)
+            if self.scared:
+                nearest = abs(nearest - 2)      # shadow it from 2 cells while scared
+            value -= 0.05 * nearest
+        return value
+
+    def rollout_move(self):
+        """Cheap rollout policy: usually step towards the nearest invader, sometimes randomly."""
+        moves = self.legal_moves()
+        if random.random() > GREEDY_PROB or not self.invaders:
+            return random.choice(moves)
+
+        world = self.world
+        target = min((p for p, _ in self.invaders), key=lambda p: world.distance(self.my_pos, p))
+        if self.scared:
+            return min(moves, key=lambda c: abs(world.distance(c, target) - 2))
+        return min(moves, key=lambda c: world.distance(c, target))
 
 
 def rollout(state, max_depth):
-    """Play up to max_depth moves with the rollout policy, then evaluate."""
+    """Play up to max_depth moves with the state's rollout policy, then evaluate."""
     for _ in range(max_depth):
         if state.is_terminal():
             break
-        state = state.step(rollout_move(state))
-    return evaluate(state)
+        state = state.step(state.rollout_move())
+    return state.evaluate()
 
 
 class Node:
@@ -366,38 +533,13 @@ class MCTSOffensiveAgent(OffensiveReflexAgent):
 
     def register_initial_state(self, game_state):
         super().register_initial_state(game_state)   # sets self.start, self.red, maze distances
-
-        walls = game_state.get_walls()
-        mid_x = walls.width // 2
-
-        # neighbours of every free cell (N/S/E/W, no Stop)
-        neighbours = {}
-        for x in range(walls.width):
-            for y in range(walls.height):
-                if walls[x][y]:
-                    continue
-                cells = []
-                for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0)):
-                    nx, ny = x + dx, y + dy
-                    if 0 <= nx < walls.width and 0 <= ny < walls.height and not walls[nx][ny]:
-                        cells.append((nx, ny))
-                neighbours[(x, y)] = cells
-
-        # our side of the middle line
-        border_x = mid_x - 1 if self.red else mid_x
-        border = [(border_x, y) for y in range(walls.height) if not walls[border_x][y]]
-
-        # distance from every cell to the nearest border cell (used every evaluate)
-        home_dist = {cell: min(self.get_maze_distance(cell, b) for b in border)
-                     for cell in neighbours}
-
-        self.world = World(neighbours, border, self.red, mid_x,
-                           self.distancer._distances, home_dist)
+        self.world = build_world(self, game_state)
         self.last_iterations = 0
 
     def build_sim_state(self, game_state):
         my_state = game_state.get_agent_state(self.index)
         my_pos = game_state.get_agent_position(self.index)
+        my_pos = (int(my_pos[0]), int(my_pos[1]))
         food = set(self.get_food(game_state).as_list())
 
         ghosts = []
@@ -408,7 +550,7 @@ class MCTSOffensiveAgent(OffensiveReflexAgent):
             if pos is not None and not enemy.is_pacman and enemy.scared_timer <= 2:
                 ghosts.append((int(pos[0]), int(pos[1])))
 
-        return SimState(self.world, my_pos, ghosts, food, my_state.num_carrying)
+        return AttackState(self.world, my_pos, ghosts, food, my_state.num_carrying)
 
     def choose_action(self, game_state):
         start = time.perf_counter()
@@ -422,8 +564,7 @@ class MCTSOffensiveAgent(OffensiveReflexAgent):
             root_state = self.build_sim_state(game_state)
             best_cell, self.last_iterations = mcts_search(root_state, deadline=start + MCTS_BUDGET)
             if best_cell is not None:
-                my_pos = root_state.my_pos
-                action = Actions.vector_to_direction((best_cell[0] - my_pos[0], best_cell[1] - my_pos[1]))
+                action = direction_to(root_state.my_pos, best_cell)
                 if action in legal:
                     return action
         except Exception as e:
@@ -467,3 +608,49 @@ class DefensiveReflexAgent(ReflexCaptureAgent):
 
     def get_weights(self, game_state, action):
         return {'num_invaders': -1000, 'on_defense': 100, 'invader_distance': -10, 'stop': -100, 'reverse': -2}
+
+
+class MCTSDefensiveAgent(DefensiveReflexAgent):
+    """Defender: MCTS while an invader is visible and I'm on our side, reflex
+    agent otherwise and as a fallback if anything goes wrong."""
+
+    def register_initial_state(self, game_state):
+        super().register_initial_state(game_state)   # sets self.start, self.red, maze distances
+        self.world = build_world(self, game_state)
+        self.last_iterations = 0
+
+    def build_sim_state(self, game_state):
+        my_state = game_state.get_agent_state(self.index)
+        my_pos = game_state.get_agent_position(self.index)
+        my_pos = (int(my_pos[0]), int(my_pos[1]))
+        food = set(self.get_food_you_are_defending(game_state).as_list())
+
+        invaders = []
+        for i in self.get_opponents(game_state):
+            enemy = game_state.get_agent_state(i)
+            pos = enemy.get_position()
+            # invader = visible and a Pacman (on our side)
+            if pos is not None and enemy.is_pacman:
+                invaders.append(((int(pos[0]), int(pos[1])), enemy.num_carrying))
+
+        return DefenseState(self.world, my_pos, invaders, food, my_state.scared_timer)
+
+    def choose_action(self, game_state):
+        start = time.perf_counter()
+        legal = game_state.get_legal_actions(self.index)
+
+        try:
+            # on our side with a visible invader: plan. Otherwise the reflex agent patrols
+            # (or walks back if I'm on the enemy side).
+            if not game_state.get_agent_state(self.index).is_pacman:
+                root_state = self.build_sim_state(game_state)
+                if root_state.invaders:
+                    best_cell, self.last_iterations = mcts_search(root_state, deadline=start + MCTS_BUDGET)
+                    if best_cell is not None:
+                        action = direction_to(root_state.my_pos, best_cell)
+                        if action in legal:
+                            return action
+        except Exception as e:
+            print(f'MCTS failed, falling back to reflex: {e!r}')
+
+        return super().choose_action(game_state)
