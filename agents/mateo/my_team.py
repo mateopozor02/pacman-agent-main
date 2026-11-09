@@ -9,7 +9,8 @@
 # A* team: each turn an agent picks a goal (a set of cells) with simple rules,
 # then plans a path to it with A* over the maze grid. Enemy ghosts are not
 # simulated; they add a danger cost to the cells around them, so the planner
-# routes around them instead of through them.
+# routes around them instead of through them. Enemies we cannot see are
+# tracked with a Bayesian filter over the noisy distance readings.
 
 import random
 import contest.util as util
@@ -39,7 +40,11 @@ def create_team(first_index, second_index, is_red,
     any extra arguments, so you should make sure that the default
     behavior is what you want for the nightly contest.
     """
-    return [eval(first)(first_index), eval(second)(second_index)]
+    agents = [eval(first)(first_index), eval(second)(second_index)]
+    beliefs = EnemyBeliefs()  # one tracker per team: both agents feed and read it
+    for agent in agents:
+        agent.beliefs = beliefs
+    return agents
 
 
 ##########
@@ -52,7 +57,147 @@ MOVES = [Directions.NORTH, Directions.SOUTH, Directions.EAST, Directions.WEST]
 DEBUG = False
 
 SIGHT_RANGE = 5      # Manhattan distance within which the engine shows enemy positions
-MEMORY_TURNS = 6     # own turns a last-seen enemy position is trusted for
+HIDDEN_GUESSES = 5   # most likely cells of a hidden enemy used for planning
+HIDDEN_WEIGHT = 0.5  # how much a hidden-ghost guess counts compared to a visible ghost
+MOTION_BIAS = 2.0    # a hidden enemy is this many times likelier to step toward its goal than elsewhere
+
+
+class EnemyBeliefs:
+    """
+    Probability distribution over cells for every enemy, shared by both agents.
+
+    Updated at each of our turns, by whichever agent is moving:
+      - visible enemy: all probability on its cell
+      - just vanished from close range: we ate it, so it is back at its start
+      - the enemy that moved since the last update: put it on the food or
+        capsule that just disappeared from our side, otherwise spread its
+        probability to neighbouring cells (it moved at most one step), favouring
+        the step toward its likely goal: our food if it is a Pacman, the border
+        if it is a ghost
+      - every hidden enemy: keep only cells consistent with the noisy distance
+        reading (noise is uniform, +-6), and remove cells that are impossible
+        (in our sight range, or on the wrong half given whether it is a Pacman)
+    """
+
+    def __init__(self):
+        self.dist = {}              # enemy index -> {cell: probability}
+        self.visible_at = {}        # enemy index -> cell, if it was visible at the previous update
+        self.food = set()           # food we defended at the previous update
+        self.capsules = set()       # capsules we defended at the previous update
+        self.to_their_border = {}   # cell -> maze distance to the enemy's border column
+
+    def initialize(self, agent, game_state):
+        if self.dist:  # the teammate already did it
+            return
+        for i in agent.get_opponents(game_state):
+            self.dist[i] = {game_state.get_initial_agent_position(i): 1.0}
+        self.food = set(agent.get_food_you_are_defending(game_state).as_list())
+        self.capsules = set(agent.get_capsules_you_are_defending(game_state))
+
+        their_x = agent.home_border[0][0] + (1 if agent.red else -1)
+        their_border = [(their_x, y) for y in range(agent.walls.height) if not agent.walls[their_x][y]]
+        self.to_their_border = self.distances_from(agent, their_border)
+
+    def update(self, agent, game_state):
+        my_pos = game_state.get_agent_position(agent.index)
+        team_positions = [game_state.get_agent_position(i) for i in agent.get_team(game_state)]
+        noisy = game_state.get_agent_distances()
+
+        # Turns go 0, 1, 2, 3, so the only enemy that moved since the last update is the previous index
+        mover = (agent.index - 1) % game_state.get_num_agents()
+
+        food_now = set(agent.get_food_you_are_defending(game_state).as_list())
+        capsules_now = set(agent.get_capsules_you_are_defending(game_state))
+        eaten = (self.food - food_now) | (self.capsules - capsules_now)
+        self.food, self.capsules = food_now, capsules_now
+        to_our_food = None  # computed only when a hidden invader needs it
+
+        for i in agent.get_opponents(game_state):
+            pos = game_state.get_agent_position(i)
+            if pos is not None:
+                self.dist[i] = {pos: 1.0}
+                self.visible_at[i] = pos
+                continue
+
+            last = self.visible_at.pop(i, None)
+            if last is not None and any(util.manhattan_distance(last, p) < SIGHT_RANGE for p in team_positions):
+                # One step from there would still be in sight, so it did not walk away: it was eaten
+                self.dist[i] = {game_state.get_initial_agent_position(i): 1.0}
+                continue
+
+            if i == mover and eaten:
+                self.dist[i] = {eaten.pop(): 1.0}  # it is standing where our food or capsule just vanished
+                continue
+
+            is_pacman = game_state.get_agent_state(i).is_pacman
+            if i == mover:
+                if is_pacman and to_our_food is None:
+                    to_our_food = self.distances_from(agent, food_now)
+                belief = self.elapse(agent, self.dist[i], to_our_food if is_pacman else self.to_their_border)
+            else:
+                belief = self.dist[i]
+            belief = self.observe(agent, game_state, belief, my_pos, noisy[i], team_positions, is_pacman)
+            if not belief:
+                # Our belief ruled out every cell (rare): restart from "anywhere consistent"
+                everywhere = {cell: 1.0 for cell in agent.walls.as_list(False)}
+                belief = self.observe(agent, game_state, everywhere, my_pos, noisy[i], team_positions, is_pacman)
+            self.dist[i] = belief or self.dist[i]
+
+    @staticmethod
+    def elapse(agent, belief, toward):
+        """
+        The enemy took one step: each cell shares its probability with itself and
+        its neighbours. Steps that bring it closer to its goal (lower value in the
+        distance map `toward`) get MOTION_BIAS times the share of the others.
+        """
+        far = float('inf')
+        new = {}
+        for cell, p in belief.items():
+            options = [cell] + [nxt for _, nxt in agent.neighbors(cell)]
+            here = toward.get(cell, far)
+            weights = [MOTION_BIAS if toward.get(nxt, far) < here else 1.0 for nxt in options]
+            total = sum(weights)
+            for nxt, w in zip(options, weights):
+                new[nxt] = new.get(nxt, 0) + p * w / total
+        return new
+
+    @staticmethod
+    def distances_from(agent, sources):
+        """Maze distance from every cell to the nearest source cell (multi-source BFS)."""
+        dist = {cell: 0 for cell in sources}
+        frontier = list(sources)
+        while frontier:
+            next_frontier = []
+            for cell in frontier:
+                for _, nxt in agent.neighbors(cell):
+                    if nxt not in dist:
+                        dist[nxt] = dist[cell] + 1
+                        next_frontier.append(nxt)
+            frontier = next_frontier
+        return dist
+
+    @staticmethod
+    def observe(agent, game_state, belief, my_pos, noisy_distance, team_positions, is_pacman):
+        """Bayes update with the noisy reading, then drop impossible cells and normalize."""
+        new = {}
+        for cell, p in belief.items():
+            if any(util.manhattan_distance(cell, t) <= SIGHT_RANGE for t in team_positions):
+                continue  # it would be visible there
+            if agent.is_home(cell) != is_pacman:
+                continue  # an enemy Pacman is on our half, an enemy ghost on theirs
+            likelihood = game_state.get_distance_prob(
+                util.manhattan_distance(cell, my_pos), noisy_distance)
+            if likelihood > 0:
+                new[cell] = p * likelihood
+        total = sum(new.values())
+        return {cell: p / total for cell, p in new.items()} if total > 0 else {}
+
+    def guesses(self, i):
+        """The HIDDEN_GUESSES most likely cells of enemy i, as (cell, probability)."""
+        return sorted(self.dist[i].items(), key=lambda item: -item[1])[:HIDDEN_GUESSES]
+
+    def most_likely(self, i):
+        return max(self.dist[i], key=self.dist[i].get)
 
 
 class AStarAgent(CaptureAgent):
@@ -65,8 +210,7 @@ class AStarAgent(CaptureAgent):
         self.start = None
         self.walls = None
         self.home_border = []
-        self.home_cells = []
-        self.last_seen = {}  # enemy index -> (position, turn it was seen)
+        self.beliefs = EnemyBeliefs()  # replaced by the team-shared one in create_team
 
     def register_initial_state(self, game_state):
         CaptureAgent.register_initial_state(self, game_state)  # precomputes maze distances
@@ -77,45 +221,21 @@ class AStarAgent(CaptureAgent):
         width, height = self.walls.width, self.walls.height
         border_x = width // 2 - 1 if self.red else width // 2
         self.home_border = [(border_x, y) for y in range(height) if not self.walls[border_x][y]]
-        self.home_cells = [(x, y) for x in range(width) for y in range(height)
-                           if not self.walls[x][y] and self.is_home((x, y))]
+
+        self.beliefs.initialize(self, game_state)
 
     def get_action(self, game_state):
-        # Runs before choose_action every turn, so both agents always have fresh memory
+        # Runs before choose_action every turn, so beliefs are always fresh
         self.observation_history.append(game_state)
-        self.update_memory(game_state)
+        self.beliefs.update(self, game_state)
+        if DEBUG:
+            self.display_distributions_over_positions(
+                [util.Counter(self.beliefs.dist[i]) if i in self.beliefs.dist else None
+                 for i in range(game_state.get_num_agents())])
         my_pos = game_state.get_agent_state(self.index).get_position()
         if my_pos != nearest_point(my_pos):  # halfway between cells, as in CaptureAgent
             return game_state.get_legal_actions(self.index)[0]
         return self.choose_action(game_state)
-
-    ##########
-    # Memory #
-    ##########
-
-    def update_memory(self, game_state):
-        """
-        Remember where each enemy was last seen. A memory is dropped when it is
-        older than MEMORY_TURNS, or when its cell is in view but the enemy is not
-        there any more (it moved away, or was eaten and respawned).
-        """
-        turn = len(self.observation_history)
-        team_positions = [game_state.get_agent_position(i) for i in self.get_team(game_state)]
-        for i in self.get_opponents(game_state):
-            pos = game_state.get_agent_position(i)
-            if pos is not None:
-                self.last_seen[i] = (pos, turn)
-            elif i in self.last_seen:
-                seen_pos, seen_turn = self.last_seen[i]
-                too_old = turn - seen_turn > MEMORY_TURNS
-                in_view = any(util.manhattan_distance(seen_pos, p) <= SIGHT_RANGE for p in team_positions)
-                if too_old or in_view:
-                    del self.last_seen[i]
-
-    def tracked_enemies(self, game_state):
-        """(index, position, age) for every enemy we see or remember; age 0 means visible now."""
-        turn = len(self.observation_history)
-        return [(i, pos, turn - seen_turn) for i, (pos, seen_turn) in self.last_seen.items()]
 
     ###########
     # Helpers #
@@ -137,40 +257,50 @@ class AStarAgent(CaptureAgent):
                 result.append((action, nxt))
         return result
 
+    def enemy_locations(self, game_state, i):
+        """
+        Where enemy i might be, as (cell, weight): its exact cell with weight 1
+        if visible, otherwise its most likely cells weighted by probability.
+        """
+        pos = game_state.get_agent_position(i)
+        if pos is not None:
+            return [(pos, 1.0)]
+        return [(cell, HIDDEN_WEIGHT * p) for cell, p in self.beliefs.guesses(i)]
+
     def dangerous_ghosts(self, game_state):
-        """
-        (position, weight) of enemy ghosts that can still eat us. Visible ghosts
-        weigh 1; remembered ones weigh less the older the memory is, since the
-        ghost has probably moved.
-        """
+        """(position, weight) of enemy ghosts, seen or guessed, that can still eat us."""
         my_pos = game_state.get_agent_position(self.index)
         ghosts = []
-        for i, pos, age in self.tracked_enemies(game_state):
+        for i in self.get_opponents(game_state):
             enemy = game_state.get_agent_state(i)  # is_pacman and scared_timer stay readable when hidden
             if enemy.is_pacman:
                 continue
-            # A scared ghost is harmless only if it stays scared until we could reach it
-            if enemy.scared_timer > self.get_maze_distance(my_pos, pos) + 1:
-                continue
-            weight = 1.0 if age == 0 else 0.5 * (1 - age / (MEMORY_TURNS + 1))
-            ghosts.append((pos, weight))
+            for pos, weight in self.enemy_locations(game_state, i):
+                # A scared ghost is harmless only if it stays scared until we could reach it
+                if enemy.scared_timer > self.get_maze_distance(my_pos, pos) + 1:
+                    continue
+                ghosts.append((pos, weight))
         return ghosts
 
     def ghost_cost(self, ghosts):
         """Step-cost function that makes cells near enemy ghosts expensive."""
+        cache = {}
+
         def cost(pos):
             if self.is_home(pos):  # ghosts cannot hurt us on our own side
                 return 0
-            penalty = 0
-            for g, weight in ghosts:
-                d = self.get_maze_distance(pos, g)
-                if d <= 1:
-                    penalty += 1000 * weight  # practically a wall for a visible ghost
-                elif d == 2:
-                    penalty += 50 * weight
-                elif d == 3:
-                    penalty += 10 * weight
-            return penalty
+            if pos not in cache:
+                penalty = 0
+                for g, weight in ghosts:
+                    d = self.get_maze_distance(pos, g)
+                    if d <= 1:
+                        penalty += 1000 * weight  # practically a wall for a visible ghost
+                    elif d == 2:
+                        penalty += 50 * weight
+                    elif d == 3:
+                        penalty += 10 * weight
+                cache[pos] = penalty
+            return cache[pos]
         return cost
 
     ############
@@ -275,7 +405,7 @@ class AStarOffensiveAgent(AStarAgent):
 
         ghosts = self.dangerous_ghosts(game_state)
         cost = self.ghost_cost(ghosts)
-        # Only ghosts we see right now trigger retreat; remembered ones just shape the path
+        # Only ghosts we see right now trigger retreat; guessed ones just shape the path
         visible = [g for g, weight in ghosts if weight == 1.0]
         ghost_dist = min([self.get_maze_distance(my_pos, g) for g in visible], default=None)
         threatened = ghost_dist is not None and ghost_dist <= self.GHOST_ALERT
@@ -304,7 +434,7 @@ class AStarOffensiveAgent(AStarAgent):
                 path = self.a_star(my_pos, self.home_border, cost)
 
         if path is None:
-            return self.safest_action(game_state, [g for g, _ in ghosts])
+            return self.safest_action(game_state, visible)
         return self.first_step(game_state, path)
 
 
@@ -312,16 +442,10 @@ class AStarDefensiveAgent(AStarAgent):
     """
     Guards our food without leaving our side.
     Goal priority:
-      1. chase a visible invader (keep a distance of 2 while scared)
-      2. go to where our food was last eaten
-      3. go to where an invader was last seen
-      4. an unseen invader is on our side: wait at the cell central to our food
-      5. patrol the border cell closest to the food we defend
+      1. chase invaders: their exact cell if visible, else their most likely
+         cell from the beliefs (keep a distance of 2 while scared)
+      2. patrol the border cell closest to the food we defend
     """
-
-    def __init__(self, index, time_for_computing=.1):
-        super().__init__(index, time_for_computing)
-        self.last_eaten = None
 
     def stay_home(self, pos):
         """Step cost that keeps the defender on our half."""
@@ -331,35 +455,19 @@ class AStarDefensiveAgent(AStarAgent):
         my_state = game_state.get_agent_state(self.index)
         my_pos = my_state.get_position()
 
-        self.update_last_eaten(game_state)
-        if self.last_eaten == my_pos:
-            self.last_eaten = None
-
         # is_pacman stays readable for hidden enemies, so we know about invaders we cannot see
-        tracked = {i: (pos, age) for i, pos, age in self.tracked_enemies(game_state)}
-        invaders_seen, invaders_remembered, invader_hidden = [], [], False
+        invaders = []
         for i in self.get_opponents(game_state):
-            if not game_state.get_agent_state(i).is_pacman:
-                continue
-            if i not in tracked:
-                invader_hidden = True
-            elif tracked[i][1] == 0:
-                invaders_seen.append(tracked[i][0])
-            else:
-                invaders_remembered.append(tracked[i][0])
+            if game_state.get_agent_state(i).is_pacman:
+                pos = game_state.get_agent_position(i)
+                invaders.append(pos if pos is not None else self.beliefs.most_likely(i))
 
-        if invaders_seen:
+        if invaders:
             if my_state.scared_timer > 0:
                 # Shadow the invader from 2 cells away so we can pounce when the timer ends
-                goals = [cell for inv in invaders_seen for cell in self.cells_at_distance(inv, 2)]
+                goals = [cell for inv in invaders for cell in self.cells_at_distance(inv, 2)]
             else:
-                goals = invaders_seen
-        elif self.last_eaten is not None:
-            goals = [self.last_eaten]
-        elif invaders_remembered:
-            goals = invaders_remembered
-        elif invader_hidden:
-            goals = [self.guard_point(game_state)]
+                goals = invaders
         else:
             goals = [self.patrol_point(game_state)]
 
@@ -370,18 +478,6 @@ class AStarDefensiveAgent(AStarAgent):
             return self.safest_action(game_state, [])
         return self.first_step(game_state, path)
 
-    def update_last_eaten(self, game_state):
-        """Remember the cell where our food most recently disappeared."""
-        previous = self.get_previous_observation()
-        if previous is None:
-            return
-        before = set(self.get_food_you_are_defending(previous).as_list())
-        now = set(self.get_food_you_are_defending(game_state).as_list())
-        eaten = before - now
-        if eaten:
-            my_pos = game_state.get_agent_position(self.index)
-            self.last_eaten = min(eaten, key=lambda p: self.get_maze_distance(my_pos, p))
-
     def patrol_point(self, game_state):
         """Border cell closest (on average) to the food we defend."""
         food = self.get_food_you_are_defending(game_state).as_list()
@@ -389,13 +485,6 @@ class AStarDefensiveAgent(AStarAgent):
             return self.home_border[len(self.home_border) // 2]
         return min(self.home_border,
                    key=lambda b: sum(self.get_maze_distance(b, f) for f in food))
-
-    def guard_point(self, game_state):
-        """Home cell with the smallest total distance to our food: quickest to reach any of it."""
-        food = self.get_food_you_are_defending(game_state).as_list()
-        if not food:
-            return self.patrol_point(game_state)
-        return min(self.home_cells, key=lambda c: sum(self.get_maze_distance(c, f) for f in food))
 
     def cells_at_distance(self, pos, dist):
         x, y = int(pos[0]), int(pos[1])
