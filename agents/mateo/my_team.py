@@ -13,6 +13,8 @@
 # tracked with a Bayesian filter over the noisy distance readings.
 
 import random
+from collections import deque
+
 import contest.util as util
 
 from contest.capture_agents import CaptureAgent
@@ -61,6 +63,9 @@ HIDDEN_GUESSES = 5   # most likely cells of a hidden enemy used for planning
 HIDDEN_WEIGHT = 0.5  # how much a hidden-ghost guess counts compared to a visible ghost
 MOTION_BIAS = 2.0    # a hidden enemy is this many times likelier to step toward its goal than elsewhere
 HOMEWARD_CARRY = 4   # an enemy Pacman carrying this many dots is assumed to be heading home
+STUCK_WINDOW = 10    # an attacker that used at most STUCK_CELLS cells in this many turns is stuck
+STUCK_CELLS = 3
+DETOUR_TURNS = 30    # turns a stuck attacker gets to reach its detour before giving up on it
 
 
 class EnemyBeliefs:
@@ -226,8 +231,13 @@ class EnemyBeliefs:
 
 class AStarAgent(CaptureAgent):
     """
-    Base class: maze bookkeeping plus the A* planner shared by both agents.
+    Base class: maze bookkeeping, the A* planner, and the two jobs (attack and
+    defend). The subclasses decide which job to do each turn.
     """
+
+    CARRY_LIMIT = 6      # food carried before heading home
+    GHOST_ALERT = 5      # maze distance at which a ghost counts as a threat
+    TIME_MARGIN = 10     # spare moves kept when racing the clock home
 
     def __init__(self, index, time_for_computing=.1):
         super().__init__(index, time_for_computing)
@@ -236,6 +246,9 @@ class AStarAgent(CaptureAgent):
         self.home_border = []
         self.home_cells = []
         self.beliefs = EnemyBeliefs()  # replaced by the team-shared one in create_team
+        self.trail = deque(maxlen=STUCK_WINDOW)  # our last cells while attacking
+        self.detour = None             # cell we committed to after getting stuck
+        self.detour_turns = 0
 
     def register_initial_state(self, game_state):
         CaptureAgent.register_initial_state(self, game_state)  # precomputes maze distances
@@ -418,39 +431,24 @@ class AStarAgent(CaptureAgent):
         return max(actions, key=margin)
 
 
-class AStarOffensiveAgent(AStarAgent):
-    """
-    Collects food on the enemy side and banks it before it gets risky.
-    Goal priority:
-      1. while on our side, eat an invader that is close by and cannot escape first
-      2. go home if time is running out, the bag is full, or a ghost is close
-         (via a capsule if that is closer than home)
-      3. otherwise the nearest food, avoiding ghosts
-    """
+    #############
+    # Attacking #
+    #############
 
-    CARRY_LIMIT = 6      # food carried before heading home
-    GHOST_ALERT = 5      # maze distance at which a ghost counts as a threat
-    TIME_MARGIN = 10     # spare moves kept when racing the clock home
-    HELP_DIST = 4        # on our side, chase a visible invader within this maze distance
-
-    def choose_action(self, game_state):
+    def attack(self, game_state):
+        """
+        Collect food on the enemy side and bank it before it gets risky.
+        Goal priority:
+          1. finish a detour, if we got stuck (see pick_detour)
+          2. go home if time is running out, the bag is full, or a ghost is close
+             (via a capsule if that is closer than home)
+          3. otherwise the nearest food, avoiding ghosts
+        """
         my_state = game_state.get_agent_state(self.index)
         my_pos = my_state.get_position()
         carrying = my_state.num_carrying
         food = self.get_food(game_state).as_list()
         capsules = self.get_capsules(game_state)
-
-        if not my_state.is_pacman and my_state.scared_timer == 0:
-            # We are a ghost here, so an invader passing close by is a cheap catch. Only go for
-            # one that cannot step back to its side before we reach it, or it just keeps us busy
-            invaders = [game_state.get_agent_position(i) for i in self.get_opponents(game_state)
-                        if game_state.get_agent_state(i).is_pacman
-                        and game_state.get_agent_position(i) is not None]
-            catchable = [inv for inv in invaders if self.get_maze_distance(my_pos, inv)
-                         <= min(self.HELP_DIST, self.beliefs.to_their_border[inv])]
-            path = self.a_star(my_pos, catchable, self.stay_home)
-            if path:
-                return self.first_step(game_state, path)
 
         ghosts = self.dangerous_ghosts(game_state)
         cost = self.ghost_cost(ghosts)
@@ -458,6 +456,20 @@ class AStarOffensiveAgent(AStarAgent):
         visible = [g for g, weight in ghosts if weight == 1.0]
         ghost_dist = min([self.get_maze_distance(my_pos, g) for g in visible], default=None)
         threatened = ghost_dist is not None and ghost_dist <= self.GHOST_ALERT
+
+        self.trail.append(my_pos)
+        if self.detour is None and len(self.trail) == STUCK_WINDOW and len(set(self.trail)) <= STUCK_CELLS:
+            # A ghost keeps mirroring us and we keep stepping back and forth: change the plan
+            self.detour, self.detour_turns = self.pick_detour(game_state, my_pos, capsules), DETOUR_TURNS
+        if self.detour is not None:
+            self.detour_turns -= 1
+            arrived = my_pos == self.detour
+            eaten = self.detour not in self.home_border and self.detour not in capsules
+            path = None if arrived or eaten or self.detour_turns < 0 else self.a_star(my_pos, [self.detour], cost)
+            if path:
+                return self.first_step(game_state, path)
+            self.detour = None
+            self.trail.clear()
 
         home_dist = min(self.get_maze_distance(my_pos, b) for b in self.home_border)
         my_moves_left = game_state.data.timeleft // 4
@@ -486,31 +498,48 @@ class AStarOffensiveAgent(AStarAgent):
             return self.safest_action(game_state, visible)
         return self.first_step(game_state, path)
 
+    def pick_detour(self, game_state, my_pos, capsules):
+        """
+        Plan B for a stuck attacker: an enemy capsule we can reach before any
+        ghost, otherwise the border cell farthest from the ghosts, to cross there.
+        """
+        dist = self.get_maze_distance
+        ghosts = [self.enemy_cell(game_state, i) for i in self.get_opponents(game_state)
+                  if not game_state.get_agent_state(i).is_pacman]
+        if not ghosts:
+            return None
+        free = [c for c in capsules if dist(my_pos, c) < min(dist(g, c) for g in ghosts)]
+        if free:
+            return min(free, key=lambda c: dist(my_pos, c))
+        return max(self.home_border, key=lambda c: min(dist(g, c) for g in ghosts))
 
-class AStarDefensiveAgent(AStarAgent):
-    """
-    Guards our food without leaving our side.
-    Goal priority:
-      1. chase invaders: their exact cell if visible, else their most likely
-         cell from the beliefs (keep a distance of 2 while scared). With two
-         invaders, go for the one carrying more food
-      2. no invader: wait at the border crossing the enemies are expected to use
-    """
+    #############
+    # Defending #
+    #############
 
-    def choose_action(self, game_state):
+    def invaders(self, game_state):
+        """(cell, food carried, visible) of every enemy on our side; hidden ones use the most likely cell."""
+        # is_pacman and num_carrying stay readable for hidden enemies, so we know about invaders we cannot see
+        return [(self.enemy_cell(game_state, i), game_state.get_agent_state(i).num_carrying,
+                 game_state.get_agent_position(i) is not None)
+                for i in self.get_opponents(game_state) if game_state.get_agent_state(i).is_pacman]
+
+    def defend(self, game_state):
+        """
+        Guard our food without leaving our side.
+        Goal priority:
+          1. chase invaders: their exact cell if visible, else their most likely
+             cell from the beliefs (keep a distance of 2 while scared). With two
+             invaders, go for the one carrying more food
+          2. no invader: wait at the border crossing the enemies are expected to use
+        """
         my_state = game_state.get_agent_state(self.index)
         my_pos = my_state.get_position()
-
-        # is_pacman and num_carrying stay readable for hidden enemies, so we know about invaders we cannot see
-        invaders = []  # (cell, food carried)
-        for i in self.get_opponents(game_state):
-            enemy = game_state.get_agent_state(i)
-            if enemy.is_pacman:
-                invaders.append((self.enemy_cell(game_state, i), enemy.num_carrying))
+        invaders = self.invaders(game_state)
 
         if invaders:
-            most = max(carrying for _, carrying in invaders)
-            targets = [cell for cell, carrying in invaders if carrying == most]
+            most = max(carrying for _, carrying, _ in invaders)
+            targets = [cell for cell, carrying, _ in invaders if carrying == most]
             if my_state.scared_timer > 0:
                 # Shadow the invader from 2 cells away so we can pounce when the timer ends
                 goals = [cell for inv in targets for cell in self.cells_at_distance(inv, 2)]
@@ -569,3 +598,34 @@ class AStarDefensiveAgent(AStarAgent):
                         and self.get_maze_distance(cell, (x, y)) == dist:
                     cells.append(cell)
         return cells or [(x, y)]
+
+
+class AStarOffensiveAgent(AStarAgent):
+    """
+    Attacks. While it is on our side it also eats an invader that is close by
+    and cannot step back to its side first.
+    """
+
+    HELP_DIST = 4        # chase a visible invader within this maze distance
+
+    def choose_action(self, game_state):
+        my_state = game_state.get_agent_state(self.index)
+        my_pos = game_state.get_agent_position(self.index)
+        if not my_state.is_pacman and my_state.scared_timer == 0:
+            # We are a ghost here, so an invader passing close by is a cheap catch. Only go for
+            # one that cannot step back to its side before we reach it, or it just keeps us busy
+            catchable = [cell for cell, _, visible in self.invaders(game_state)
+                         if visible and self.get_maze_distance(my_pos, cell)
+                         <= min(self.HELP_DIST, self.beliefs.to_their_border[cell])]
+            path = self.a_star(my_pos, catchable, self.stay_home)
+            if path:
+                self.trail.clear()  # chasing an invader is not being stuck
+                return self.first_step(game_state, path)
+        return self.attack(game_state)
+
+
+class AStarDefensiveAgent(AStarAgent):
+    """Defends."""
+
+    def choose_action(self, game_state):
+        return self.defend(game_state)
