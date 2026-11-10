@@ -88,6 +88,7 @@ class EnemyBeliefs:
         self.dist = {}              # enemy index -> {cell: probability}
         self.visible_at = {}        # enemy index -> cell, if it was visible at the previous update
         self.returned = {}          # enemy index -> num_returned at the previous update
+        self.attackers = set()      # enemies that have crossed to our side at least once
         self.food = set()           # food we defended at the previous update
         self.capsules = set()       # capsules we defended at the previous update
         self.their_border = []      # first column on the enemy's side
@@ -124,6 +125,8 @@ class EnemyBeliefs:
             enemy = game_state.get_agent_state(i)
             banked = enemy.num_returned > self.returned[i]
             self.returned[i] = enemy.num_returned
+            if enemy.is_pacman:
+                self.attackers.add(i)
 
             pos = game_state.get_agent_position(i)
             if pos is not None:
@@ -231,6 +234,7 @@ class AStarAgent(CaptureAgent):
         self.start = None
         self.walls = None
         self.home_border = []
+        self.home_cells = []
         self.beliefs = EnemyBeliefs()  # replaced by the team-shared one in create_team
 
     def register_initial_state(self, game_state):
@@ -242,6 +246,7 @@ class AStarAgent(CaptureAgent):
         width, height = self.walls.width, self.walls.height
         border_x = width // 2 - 1 if self.red else width // 2
         self.home_border = [(border_x, y) for y in range(height) if not self.walls[border_x][y]]
+        self.home_cells = [cell for cell in self.walls.as_list(False) if self.is_home(cell)]
 
         self.beliefs.initialize(self, game_state)
 
@@ -266,6 +271,15 @@ class AStarAgent(CaptureAgent):
         """True if the cell is on our half of the board."""
         mid = self.walls.width // 2
         return pos[0] < mid if self.red else pos[0] >= mid
+
+    def stay_home(self, pos):
+        """Step cost that keeps a path on our half."""
+        return 0 if self.is_home(pos) else 1000
+
+    def enemy_cell(self, game_state, i):
+        """Best single guess of where enemy i is: its cell if visible, else the most likely one."""
+        pos = game_state.get_agent_position(i)
+        return pos if pos is not None else self.beliefs.most_likely(i)
 
     def neighbors(self, pos):
         """(action, next_pos) pairs for every non-wall move from pos."""
@@ -408,14 +422,16 @@ class AStarOffensiveAgent(AStarAgent):
     """
     Collects food on the enemy side and banks it before it gets risky.
     Goal priority:
-      1. go home if time is running out, the bag is full, or a ghost is close
+      1. while on our side, eat an invader that is close by and cannot escape first
+      2. go home if time is running out, the bag is full, or a ghost is close
          (via a capsule if that is closer than home)
-      2. otherwise the nearest food, avoiding ghosts
+      3. otherwise the nearest food, avoiding ghosts
     """
 
     CARRY_LIMIT = 6      # food carried before heading home
     GHOST_ALERT = 5      # maze distance at which a ghost counts as a threat
     TIME_MARGIN = 10     # spare moves kept when racing the clock home
+    HELP_DIST = 4        # on our side, chase a visible invader within this maze distance
 
     def choose_action(self, game_state):
         my_state = game_state.get_agent_state(self.index)
@@ -423,6 +439,18 @@ class AStarOffensiveAgent(AStarAgent):
         carrying = my_state.num_carrying
         food = self.get_food(game_state).as_list()
         capsules = self.get_capsules(game_state)
+
+        if not my_state.is_pacman and my_state.scared_timer == 0:
+            # We are a ghost here, so an invader passing close by is a cheap catch. Only go for
+            # one that cannot step back to its side before we reach it, or it just keeps us busy
+            invaders = [game_state.get_agent_position(i) for i in self.get_opponents(game_state)
+                        if game_state.get_agent_state(i).is_pacman
+                        and game_state.get_agent_position(i) is not None]
+            catchable = [inv for inv in invaders if self.get_maze_distance(my_pos, inv)
+                         <= min(self.HELP_DIST, self.beliefs.to_their_border[inv])]
+            path = self.a_star(my_pos, catchable, self.stay_home)
+            if path:
+                return self.first_step(game_state, path)
 
         ghosts = self.dangerous_ghosts(game_state)
         cost = self.ghost_cost(ghosts)
@@ -466,12 +494,8 @@ class AStarDefensiveAgent(AStarAgent):
       1. chase invaders: their exact cell if visible, else their most likely
          cell from the beliefs (keep a distance of 2 while scared). With two
          invaders, go for the one carrying more food
-      2. patrol the border cell closest to the food we defend
+      2. no invader: wait at the border crossing the enemies are expected to use
     """
-
-    def stay_home(self, pos):
-        """Step cost that keeps the defender on our half."""
-        return 0 if self.is_home(pos) else 1000
 
     def choose_action(self, game_state):
         my_state = game_state.get_agent_state(self.index)
@@ -482,8 +506,7 @@ class AStarDefensiveAgent(AStarAgent):
         for i in self.get_opponents(game_state):
             enemy = game_state.get_agent_state(i)
             if enemy.is_pacman:
-                pos = game_state.get_agent_position(i)
-                invaders.append((pos if pos is not None else self.beliefs.most_likely(i), enemy.num_carrying))
+                invaders.append((self.enemy_cell(game_state, i), enemy.num_carrying))
 
         if invaders:
             most = max(carrying for _, carrying in invaders)
@@ -494,7 +517,7 @@ class AStarDefensiveAgent(AStarAgent):
             else:
                 goals = targets
         else:
-            goals = [self.patrol_point(game_state)]
+            goals = [self.guard_point(game_state)]
 
         path = self.a_star(my_pos, goals, self.stay_home)
         if path is None:
@@ -502,6 +525,31 @@ class AStarDefensiveAgent(AStarAgent):
         if path is None:
             return self.safest_action(game_state, [])
         return self.first_step(game_state, path)
+
+    def guard_point(self, game_state):
+        """
+        Where to wait while no enemy is on our side. Enemies come for our food, so
+        each one is expected to cross at the border cell on its shortest way to the
+        nearest dot. We want to be at that cell no later than the enemy: pick the
+        home cell with the smallest lateness (our distance to the crossing minus
+        the enemy's), taking the worse of the two when they use different crossings.
+        Once some enemy has crossed, enemies that never have are ignored: they
+        are probably defenders.
+        """
+        ghosts = [i for i in self.get_opponents(game_state) if not game_state.get_agent_state(i).is_pacman]
+        watched = [i for i in ghosts if i in self.beliefs.attackers] or ghosts
+        food = self.get_food_you_are_defending(game_state).as_list()
+        if not watched or not food:
+            return self.patrol_point(game_state)
+        dist = self.get_maze_distance
+        to_food = {c: min(dist(c, f) for f in food) for c in self.home_border}
+
+        arrival = {}  # expected crossing -> steps until an enemy gets there
+        for i in watched:
+            enemy = self.enemy_cell(game_state, i)
+            crossing = min(self.home_border, key=lambda c: dist(enemy, c) + to_food[c])
+            arrival[crossing] = min(arrival.get(crossing, float('inf')), dist(enemy, crossing))
+        return min(self.home_cells, key=lambda p: max(dist(p, c) - steps for c, steps in arrival.items()))
 
     def patrol_point(self, game_state):
         """Border cell closest (on average) to the food we defend."""
