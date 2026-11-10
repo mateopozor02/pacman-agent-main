@@ -465,12 +465,9 @@ class AStarDefensiveAgent(AStarAgent):
     Goal priority:
       1. chase invaders: their exact cell if visible, else their most likely
          cell from the beliefs (keep a distance of 2 while scared). With two
-         invaders, go for the one carrying more food; if it carries enough to
-         be heading home, wait at its exit on the border when we get there first
+         invaders, go for the one carrying more food
       2. patrol the border cell closest to the food we defend
     """
-
-    INTERCEPT_DIST = 2   # closer than this to the invader, chase it instead of cutting it off
 
     def stay_home(self, pos):
         """Step cost that keeps the defender on our half."""
@@ -494,8 +491,6 @@ class AStarDefensiveAgent(AStarAgent):
             if my_state.scared_timer > 0:
                 # Shadow the invader from 2 cells away so we can pounce when the timer ends
                 goals = [cell for inv in targets for cell in self.cells_at_distance(inv, 2)]
-            elif most >= HOMEWARD_CARRY:
-                goals = [self.intercept_point(my_pos, inv) for inv in targets]
             else:
                 goals = targets
         else:
@@ -507,19 +502,6 @@ class AStarDefensiveAgent(AStarAgent):
         if path is None:
             return self.safest_action(game_state, [])
         return self.first_step(game_state, path)
-
-    def intercept_point(self, my_pos, invader):
-        """
-        Where to meet an invader that is heading home: the border cell it would
-        leave through, if we reach it no later than the invader; otherwise the
-        invader itself.
-        """
-        if self.get_maze_distance(my_pos, invader) < self.INTERCEPT_DIST:
-            return invader
-        exit_cell = min(self.home_border, key=lambda b: self.get_maze_distance(invader, b))
-        if self.get_maze_distance(my_pos, exit_cell) <= self.get_maze_distance(invader, exit_cell):
-            return exit_cell
-        return invader
 
     def patrol_point(self, game_state):
         """Border cell closest (on average) to the food we defend."""
