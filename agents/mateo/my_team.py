@@ -60,6 +60,7 @@ SIGHT_RANGE = 5      # Manhattan distance within which the engine shows enemy po
 HIDDEN_GUESSES = 5   # most likely cells of a hidden enemy used for planning
 HIDDEN_WEIGHT = 0.5  # how much a hidden-ghost guess counts compared to a visible ghost
 MOTION_BIAS = 2.0    # a hidden enemy is this many times likelier to step toward its goal than elsewhere
+HOMEWARD_CARRY = 4   # an enemy Pacman carrying this many dots is assumed to be heading home
 
 
 class EnemyBeliefs:
@@ -70,20 +71,26 @@ class EnemyBeliefs:
       - visible enemy: all probability on its cell
       - just vanished from close range: we ate it, so it is back at its start
       - the enemy that moved since the last update: put it on the food or
-        capsule that just disappeared from our side, otherwise spread its
-        probability to neighbouring cells (it moved at most one step), favouring
-        the step toward its likely goal: our food if it is a Pacman, the border
-        if it is a ghost
+        capsule that just disappeared from our side, or on the enemy's border
+        column if its num_returned just went up (it crossed home to bank food);
+        otherwise spread its probability to neighbouring cells (it moved at most
+        one step), favouring the step toward its likely goal: our food if it is a
+        Pacman, its home if it is a Pacman carrying a lot, the border if it is a ghost
       - every hidden enemy: keep only cells consistent with the noisy distance
         reading (noise is uniform, +-6), and remove cells that are impossible
         (in our sight range, or on the wrong half given whether it is a Pacman)
+
+    Hidden enemies keep their position secret, but the engine still exposes
+    is_pacman, scared_timer, num_carrying and num_returned; this class uses them.
     """
 
     def __init__(self):
         self.dist = {}              # enemy index -> {cell: probability}
         self.visible_at = {}        # enemy index -> cell, if it was visible at the previous update
+        self.returned = {}          # enemy index -> num_returned at the previous update
         self.food = set()           # food we defended at the previous update
         self.capsules = set()       # capsules we defended at the previous update
+        self.their_border = []      # first column on the enemy's side
         self.to_their_border = {}   # cell -> maze distance to the enemy's border column
 
     def initialize(self, agent, game_state):
@@ -91,12 +98,13 @@ class EnemyBeliefs:
             return
         for i in agent.get_opponents(game_state):
             self.dist[i] = {game_state.get_initial_agent_position(i): 1.0}
+            self.returned[i] = 0
         self.food = set(agent.get_food_you_are_defending(game_state).as_list())
         self.capsules = set(agent.get_capsules_you_are_defending(game_state))
 
         their_x = agent.home_border[0][0] + (1 if agent.red else -1)
-        their_border = [(their_x, y) for y in range(agent.walls.height) if not agent.walls[their_x][y]]
-        self.to_their_border = self.distances_from(agent, their_border)
+        self.their_border = [(their_x, y) for y in range(agent.walls.height) if not agent.walls[their_x][y]]
+        self.to_their_border = self.distances_from(agent, self.their_border)
 
     def update(self, agent, game_state):
         my_pos = game_state.get_agent_position(agent.index)
@@ -113,6 +121,10 @@ class EnemyBeliefs:
         to_our_food = None  # computed only when a hidden invader needs it
 
         for i in agent.get_opponents(game_state):
+            enemy = game_state.get_agent_state(i)
+            banked = enemy.num_returned > self.returned[i]
+            self.returned[i] = enemy.num_returned
+
             pos = game_state.get_agent_position(i)
             if pos is not None:
                 self.dist[i] = {pos: 1.0}
@@ -129,11 +141,20 @@ class EnemyBeliefs:
                 self.dist[i] = {eaten.pop(): 1.0}  # it is standing where our food or capsule just vanished
                 continue
 
-            is_pacman = game_state.get_agent_state(i).is_pacman
-            if i == mover:
-                if is_pacman and to_our_food is None:
-                    to_our_food = self.distances_from(agent, food_now)
-                belief = self.elapse(agent, self.dist[i], to_our_food if is_pacman else self.to_their_border)
+            is_pacman = enemy.is_pacman
+            if banked:
+                # Food is banked on the step that crosses home, so it is on its border column now
+                belief = {cell: 1.0 for cell in self.their_border}
+            elif i == mover:
+                if is_pacman and enemy.num_carrying >= HOMEWARD_CARRY:
+                    toward = self.to_their_border
+                elif is_pacman:
+                    if to_our_food is None:
+                        to_our_food = self.distances_from(agent, food_now)
+                    toward = to_our_food
+                else:
+                    toward = self.to_their_border
+                belief = self.elapse(agent, self.dist[i], toward)
             else:
                 belief = self.dist[i]
             belief = self.observe(agent, game_state, belief, my_pos, noisy[i], team_positions, is_pacman)
@@ -443,9 +464,13 @@ class AStarDefensiveAgent(AStarAgent):
     Guards our food without leaving our side.
     Goal priority:
       1. chase invaders: their exact cell if visible, else their most likely
-         cell from the beliefs (keep a distance of 2 while scared)
+         cell from the beliefs (keep a distance of 2 while scared). With two
+         invaders, go for the one carrying more food; if it carries enough to
+         be heading home, wait at its exit on the border when we get there first
       2. patrol the border cell closest to the food we defend
     """
+
+    INTERCEPT_DIST = 2   # closer than this to the invader, chase it instead of cutting it off
 
     def stay_home(self, pos):
         """Step cost that keeps the defender on our half."""
@@ -455,19 +480,24 @@ class AStarDefensiveAgent(AStarAgent):
         my_state = game_state.get_agent_state(self.index)
         my_pos = my_state.get_position()
 
-        # is_pacman stays readable for hidden enemies, so we know about invaders we cannot see
-        invaders = []
+        # is_pacman and num_carrying stay readable for hidden enemies, so we know about invaders we cannot see
+        invaders = []  # (cell, food carried)
         for i in self.get_opponents(game_state):
-            if game_state.get_agent_state(i).is_pacman:
+            enemy = game_state.get_agent_state(i)
+            if enemy.is_pacman:
                 pos = game_state.get_agent_position(i)
-                invaders.append(pos if pos is not None else self.beliefs.most_likely(i))
+                invaders.append((pos if pos is not None else self.beliefs.most_likely(i), enemy.num_carrying))
 
         if invaders:
+            most = max(carrying for _, carrying in invaders)
+            targets = [cell for cell, carrying in invaders if carrying == most]
             if my_state.scared_timer > 0:
                 # Shadow the invader from 2 cells away so we can pounce when the timer ends
-                goals = [cell for inv in invaders for cell in self.cells_at_distance(inv, 2)]
+                goals = [cell for inv in targets for cell in self.cells_at_distance(inv, 2)]
+            elif most >= HOMEWARD_CARRY:
+                goals = [self.intercept_point(my_pos, inv) for inv in targets]
             else:
-                goals = invaders
+                goals = targets
         else:
             goals = [self.patrol_point(game_state)]
 
@@ -477,6 +507,19 @@ class AStarDefensiveAgent(AStarAgent):
         if path is None:
             return self.safest_action(game_state, [])
         return self.first_step(game_state, path)
+
+    def intercept_point(self, my_pos, invader):
+        """
+        Where to meet an invader that is heading home: the border cell it would
+        leave through, if we reach it no later than the invader; otherwise the
+        invader itself.
+        """
+        if self.get_maze_distance(my_pos, invader) < self.INTERCEPT_DIST:
+            return invader
+        exit_cell = min(self.home_border, key=lambda b: self.get_maze_distance(invader, b))
+        if self.get_maze_distance(my_pos, exit_cell) <= self.get_maze_distance(invader, exit_cell):
+            return exit_cell
+        return invader
 
     def patrol_point(self, game_state):
         """Border cell closest (on average) to the food we defend."""
