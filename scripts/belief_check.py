@@ -1,8 +1,8 @@
 """
 Measure how accurately a team's EnemyBeliefs tracker locates hidden enemies.
 
-Plays a few games against the baseline and, every time the tracker updates,
-compares its most likely cell for each hidden enemy with the enemy's true cell.
+Plays a few games against an opponent (baseline by default) and, every time
+the tracker updates, compares its most likely cell for each hidden enemy with the enemy's true cell.
 The true state is read by hooking the engine from this script only; the agent
 itself never sees it.
 
@@ -10,6 +10,7 @@ Usage (from the repo root, venv active):
     python scripts/belief_check.py                 # agents/mateo/my_team.py
     python scripts/belief_check.py mateo
     python scripts/belief_check.py path/to/team.py --layouts defaultCapture RANDOM3
+    python scripts/belief_check.py mateo --opponent caspar
 """
 
 import argparse
@@ -27,6 +28,8 @@ DEFAULT_LAYOUTS = ['defaultCapture', 'RANDOM3', 'jumboCapture', 'officeCapture',
 
 
 def resolve_team(team):
+    if team == 'baseline':
+        return 'baseline_team'
     if team.endswith('.py'):
         return os.path.abspath(team)
     path = os.path.join(ROOT, 'agents', team, 'my_team.py')
@@ -38,9 +41,11 @@ def resolve_team(team):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('team', nargs='?', default='mateo', help='team name or path to my_team.py')
+    parser.add_argument('--opponent', default='baseline', help='team to play against (name or path)')
     parser.add_argument('--layouts', nargs='*', default=DEFAULT_LAYOUTS, help='layouts to play')
     args = parser.parse_args()
     team_path = resolve_team(args.team)
+    opponent_path = resolve_team(args.opponent)
 
     import contest.capture as capture
     from contest.util import manhattan_distance
@@ -65,19 +70,19 @@ def main():
                 real = true_state['state'].get_agent_position(i)
                 errors.append(manhattan_distance(real, self.most_likely(i)))
 
-    # The engine loads team files itself, so patch EnemyBeliefs as soon as the module is executed
+    # The engine loads the team file afresh for every game, so patch EnemyBeliefs each time it is executed
     exec_module = importlib.machinery.SourceFileLoader.exec_module
 
     def patched_exec_module(self, module):
         exec_module(self, module)
-        if hasattr(module, 'EnemyBeliefs') and 'update' not in original:
+        if getattr(module, '__file__', None) == team_path:
             original['update'] = module.EnemyBeliefs.update
             module.EnemyBeliefs.update = update
     importlib.machinery.SourceFileLoader.exec_module = patched_exec_module
 
     os.chdir(CONTEST_DIR)  # layouts are looked up relative to the working directory
     for layout in args.layouts:
-        argv = ['-r', team_path, '-b', 'baseline_team', '-l', layout, '-Q', '-c']
+        argv = ['-r', team_path, '-b', opponent_path, '-l', layout, '-Q', '-c']
         with contextlib.redirect_stdout(io.StringIO()):
             capture.run_games(**capture.read_command(argv))
 
