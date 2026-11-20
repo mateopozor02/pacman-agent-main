@@ -15,6 +15,7 @@ Opponent pool: play each listed team against a fixed set of opponents only
 (no games between the opponents) and compare score margins side by side:
     python scripts/eval.py mateo --pool                 # vs the default pool
     python scripts/eval.py mateo mateo@HEAD~1 --pool    # new version vs previous commit
+    python scripts/eval.py mateo mateo@origin/main --pool  # vs the version merged on GitHub
     python scripts/eval.py mateo --pool rush turtle     # vs a custom pool
 
 Team shortcuts:
@@ -74,6 +75,13 @@ def team_path(team):
 def snapshot(team, rev):
     """Writes the team's file as of git revision rev to a temporary file and returns its path."""
     rel = os.path.relpath(team_path(team), ROOT)
+    upstream = subprocess.run(['git', 'rev-parse', '--abbrev-ref', f'{rev}@{{upstream}}'], cwd=ROOT,
+                              capture_output=True, text=True).stdout.strip()
+    if upstream:
+        here, there = (subprocess.run(['git', 'rev-parse', r], cwd=ROOT, capture_output=True, text=True).stdout
+                       for r in (rev, upstream))
+        if here != there:
+            print(f'Warning: local {rev} differs from {upstream}; use {team}@{upstream} for the pushed version')
     try:
         source = subprocess.run(['git', 'show', f'{rev}:{rel}'], cwd=ROOT, check=True,
                                 capture_output=True, text=True).stdout
@@ -154,19 +162,20 @@ def summarize_pool(teams, pool, results):
             c[3] += margin
             c[4] += 1
 
-    width = max(len(t) for t in teams)
+    labels = [os.path.basename(t) if t.endswith('.py') else t for t in teams]  # file paths get long
+    width = max(16, *(len(label) for label in labels))
     print('\n=== Versus pool (wins-ties-losses, average score margin) ===')
-    print(f'  {"opponent":<20}' + ''.join(f'  {t:>{max(width, 16)}}' for t in teams))
+    print(f'  {"opponent":<20}' + ''.join(f'  {label:>{width}}' for label in labels))
     for opp in pool + ['ALL']:
         row = f'  {opp:<20}'
         for t in teams:
             cs = [cell.get((t, o)) for o in pool] if opp == 'ALL' else [cell.get((t, opp))]
             cs = [c for c in cs if c]
             if not cs:
-                row += f'  {"-":>{max(width, 16)}}'
+                row += f'  {"-":>{width}}'
                 continue
             w, ti, l, m, n = (sum(c[k] for c in cs) for k in range(5))
-            row += f'  {f"{w}-{ti}-{l} {m / n:+6.2f}":>{max(width, 16)}}'
+            row += f'  {f"{w}-{ti}-{l} {m / n:+6.2f}":>{width}}'
         print(row)
 
 
