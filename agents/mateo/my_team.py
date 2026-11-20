@@ -259,6 +259,9 @@ class AStarAgent(CaptureAgent):
     INTERCEPT_CARRY = 3  # only invaders carrying at least this many dots
     INTERCEPT_RANGE = 5  # only when the invader is at most this many steps from its crossing
 
+    # Endgame: with this many moves left, the score decides the roles (see endgame)
+    ENDGAME_MOVES = 75
+
     def __init__(self, index, time_for_computing=.1):
         super().__init__(index, time_for_computing)
         self.start = None
@@ -467,6 +470,26 @@ class AStarAgent(CaptureAgent):
             return path[0]
         return Directions.STOP
 
+    def retreat(self, game_state):
+        """Back to our side, avoiding ghosts."""
+        my_pos = game_state.get_agent_position(self.index)
+        ghosts = self.dangerous_ghosts(game_state)
+        path = self.a_star(my_pos, self.home_border, self.ghost_cost(ghosts))
+        if path is None:
+            return self.safest_action(game_state, [g for g, weight in ghosts if weight == 1.0])
+        return self.first_step(game_state, path)
+
+    def endgame(self, game_state):
+        """
+        'all_in' when behind with at most ENDGAME_MOVES moves left (both agents
+        attack: only food can still change the result), 'lock' when ahead (both
+        defend: the lead wins if nothing is lost), otherwise None.
+        """
+        if moves_left(game_state) > self.ENDGAME_MOVES:
+            return None
+        score = self.get_score(game_state)
+        return 'all_in' if score < 0 else 'lock' if score > 0 else None
+
     def safest_action(self, game_state, ghosts):
         """Fallback when nothing is reachable: move as far as possible from the ghosts."""
         actions = [a for a in game_state.get_legal_actions(self.index) if a != Directions.STOP]
@@ -654,12 +677,14 @@ class AStarAgent(CaptureAgent):
         INTERCEPT_CARRY dots and at most INTERCEPT_RANGE steps from its nearest
         crossing is about to bank them; if we reach that crossing strictly
         before it (and no later than we could reach the invader itself),
-        waiting there catches it on the way out. Loaded invaders first.
+        waiting there catches it on the way out. Only with a single invader.
         """
-        if not self.is_home(my_pos) or not self.crossings:
+        invaders = self.invaders(game_state)
+        # With two invaders, parking at one crossing leaves the other free to eat
+        if not self.is_home(my_pos) or not self.crossings or len(invaders) > 1:
             return None
         dist = self.get_maze_distance
-        for invader, carried, seen in sorted(self.invaders(game_state), key=lambda item: -item[1]):
+        for invader, carried, seen in sorted(invaders, key=lambda item: -item[1]):
             if not seen or carried < self.INTERCEPT_CARRY:
                 continue
             crossing = min(self.crossings, key=lambda cell: dist(invader, cell))
@@ -718,8 +743,10 @@ class AStarAgent(CaptureAgent):
 class AStarOffensiveAgent(AStarAgent):
     """
     Attacks. While it is still on our side as a ghost, it first helps at home:
-    it defends when the defender is out raiding and an invader is close, and it
-    eats an invader that is close by and cannot step back to its side first.
+    it defends when an invader is close and the defender is out raiding or
+    facing a second invader, and it eats an invader that is close by and cannot
+    step back to its side first. When ahead in the endgame it goes home and
+    defends instead (see endgame).
     """
 
     HELP_DIST = 4        # chase a visible invader within this maze distance
@@ -729,12 +756,17 @@ class AStarOffensiveAgent(AStarAgent):
     def choose_action(self, game_state):
         my_state = game_state.get_agent_state(self.index)
         my_pos = game_state.get_agent_position(self.index)
+        if self.endgame(game_state) == 'lock':
+            self.trail.clear()
+            return self.retreat(game_state) if my_state.is_pacman else self.defend(game_state)
         if not my_state.is_pacman and my_state.scared_timer == 0:
             teammate = next(i for i in self.get_team(game_state) if i != self.index)
-            if game_state.get_agent_state(teammate).is_pacman:
-                # The defender is raiding, so nobody guards our food: cover for it
+            invaders = self.invaders(game_state)
+            if game_state.get_agent_state(teammate).is_pacman or len(invaders) > 1:
+                # Nobody guards our food (the defender is raiding) or the defender
+                # cannot handle two invaders alone: help at home
                 if any((visible or load >= self.COVER_LOAD) and self.get_maze_distance(my_pos, cell) <= self.COVER_DIST
-                       for cell, load, visible in self.invaders(game_state)):
+                       for cell, load, visible in invaders):
                     self.trail.clear()
                     return self.defend(game_state)
             # We are a ghost here, so an invader passing close by is a cheap catch. Only go for
@@ -754,7 +786,8 @@ class AStarDefensiveAgent(AStarAgent):
     Defends, but raids food near the border while no enemy is on our side and
     the round trip fits before an enemy attacker could reach our border.
     Enemies stay flagged as Pacmen even when hidden, so it knows the moment one
-    crosses and runs back home.
+    crosses and runs back home. When behind in the endgame it attacks with
+    everything instead, and when ahead it stops raiding (see endgame).
     """
 
     RAID_RANGE = 8       # only food within this many steps of our border
@@ -792,17 +825,27 @@ class AStarDefensiveAgent(AStarAgent):
 
     def choose_action(self, game_state):
         """
+        0. endgame: behind, attack like the attacker does; ahead, only defend
         1. any invader: go home if raiding, then defend
-        2. raiding with a full bag (RAID_CARRY, or LEAD_RAID_CARRY when ahead
+        2. raiding and a visible ghost within GHOST_ALERT: go home
+        3. raiding with a full bag (RAID_CARRY, or LEAD_RAID_CARRY when ahead
            late) or almost out of time: go home
-        3. no raid while a watched enemy is within RAID_ALERT of our border
-        4. otherwise raid the best dot whose round trip fits before the enemy
+        4. no raid while a watched enemy is within RAID_ALERT of our border
+        5. otherwise raid the best dot whose round trip fits before the enemy
            could arrive (plus COVER_SLACK while our attacker is home); if none
            fits, go home or defend
         """
         my_state = game_state.get_agent_state(self.index)
-        if self.invaders(game_state):
+        mode = self.endgame(game_state)
+        if mode == 'all_in':
+            return self.attack(game_state)
+        if mode == 'lock' or self.invaders(game_state):
             return self.stand_down(game_state)
+        if my_state.is_pacman:
+            my_pos = my_state.get_position()
+            if any(weight == 1.0 and self.get_maze_distance(my_pos, g) <= self.GHOST_ALERT
+                   for g, weight in self.dangerous_ghosts(game_state)):
+                return self.stand_down(game_state)  # a ghost is onto the raid
 
         left = moves_left(game_state)
         ahead = self.get_score(game_state) > 0
@@ -901,12 +944,3 @@ class AStarDefensiveAgent(AStarAgent):
                 self.raid_goal = target
                 return self.first_step(game_state, path)
         return None
-
-    def retreat(self, game_state):
-        """Back to our side, avoiding ghosts."""
-        my_pos = game_state.get_agent_position(self.index)
-        ghosts = self.dangerous_ghosts(game_state)
-        path = self.a_star(my_pos, self.home_border, self.ghost_cost(ghosts))
-        if path is None:
-            return self.safest_action(game_state, [g for g, weight in ghosts if weight == 1.0])
-        return self.first_step(game_state, path)
