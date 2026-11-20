@@ -42,7 +42,8 @@ def create_team(first_index, second_index, is_red,
     any extra arguments, so you should make sure that the default
     behavior is what you want for the nightly contest.
     """
-    agents = [eval(first)(first_index), eval(second)(second_index)]
+    roles = {'AStarOffensiveAgent': AStarOffensiveAgent, 'AStarDefensiveAgent': AStarDefensiveAgent}
+    agents = [roles[first](first_index), roles[second](second_index)]
     beliefs = EnemyBeliefs()  # one tracker per team: both agents feed and read it
     for agent in agents:
         agent.beliefs = beliefs
@@ -66,6 +67,11 @@ HOMEWARD_CARRY = 4   # an enemy Pacman carrying this many dots is assumed to be 
 STUCK_WINDOW = 10    # an attacker that used at most STUCK_CELLS cells in this many turns is stuck
 STUCK_CELLS = 3
 DETOUR_TURNS = 30    # turns a stuck attacker gets to reach its detour before giving up on it
+
+
+def home_dist_due(state, distance, origin, border, margin):
+    left = (state.data.timeleft + state.get_num_agents() - 1) // state.get_num_agents()
+    return min(distance(origin, cell) for cell in border) + margin >= left
 
 
 class EnemyBeliefs:
@@ -238,6 +244,11 @@ class AStarAgent(CaptureAgent):
     CARRY_LIMIT = 6      # food carried before heading home
     GHOST_ALERT = 5      # maze distance at which a ghost counts as a threat
     TIME_MARGIN = 10     # spare moves kept when racing the clock home
+    SMART_RAIDS = True
+    COVER_RAIDER = True
+    SHORT_FEAST = True
+    PRESSURE = False
+    INTERCEPT = True
     SCARED_MARGIN = 4    # spare moves kept when racing the end of the enemy's scared time home
 
     def __init__(self, index, time_for_computing=.1):
@@ -263,6 +274,9 @@ class AStarAgent(CaptureAgent):
         self.home_cells = [cell for cell in self.walls.as_list(False) if self.is_home(cell)]
 
         self.beliefs.initialize(self, game_state)
+        self.crossings = [cell for cell in self.home_border
+                          if any(not self.is_home(nxt) for _, nxt in self.neighbors(cell))]
+        self.dead_ends = self.find_dead_ends()
 
     def get_action(self, game_state):
         # Runs before choose_action every turn, so beliefs are always fresh
@@ -275,7 +289,9 @@ class AStarAgent(CaptureAgent):
         my_pos = game_state.get_agent_state(self.index).get_position()
         if my_pos != nearest_point(my_pos):  # halfway between cells, as in CaptureAgent
             return game_state.get_legal_actions(self.index)[0]
-        return self.choose_action(game_state)
+        move = self.choose_action(game_state)
+        legal = game_state.get_legal_actions(self.index)
+        return move if move in legal else legal[0]
 
     ###########
     # Helpers #
@@ -315,6 +331,28 @@ class AStarAgent(CaptureAgent):
         if pos is not None:
             return [(pos, 1.0)]
         return [(cell, HIDDEN_WEIGHT * p) for cell, p in self.beliefs.guesses(i)]
+
+    def find_dead_ends(self):
+        """Peel enemy-side leaves, then trace each pocket back to its exit."""
+        remaining = {cell: {nxt for _, nxt in self.neighbors(cell)}
+                     for cell in self.walls.as_list(False) if not self.is_home(cell)}
+        leaves = deque(cell for cell, links in remaining.items() if len(links) == 1)
+        parents = {}
+        while leaves:
+            cell = leaves.popleft()
+            if len(remaining[cell]) != 1:
+                continue
+            exit_step = next(iter(remaining.pop(cell)))
+            parents[cell] = exit_step
+            if exit_step in remaining:
+                remaining[exit_step].remove(cell)
+                if len(remaining[exit_step]) == 1:
+                    leaves.append(exit_step)
+        pockets = {}
+        for cell, step in reversed(list(parents.items())):
+            exit_cell, depth = pockets.get(step, (step, 0))
+            pockets[cell] = (exit_cell, depth + 1)
+        return pockets
 
     def dangerous_ghosts(self, game_state):
         """(position, weight) of enemy ghosts, seen or guessed, that can still eat us."""
@@ -459,6 +497,10 @@ class AStarAgent(CaptureAgent):
         ghost_dist = min([self.get_maze_distance(my_pos, g) for g in visible], default=None)
         threatened = ghost_dist is not None and ghost_dist <= self.GHOST_ALERT
 
+        if self.SHORT_FEAST and carrying and (threatened or home_dist_due(
+                game_state, self.get_maze_distance, my_pos, self.home_border, self.TIME_MARGIN)):
+            self.detour = None
+            self.trail.clear()
         self.trail.append(my_pos)
         if self.detour is None and len(self.trail) == STUCK_WINDOW and len(set(self.trail)) <= STUCK_CELLS:
             # A ghost keeps mirroring us and we keep stepping back and forth: change the plan
@@ -481,6 +523,25 @@ class AStarAgent(CaptureAgent):
         scared = [game_state.get_agent_state(i).scared_timer for i in self.get_opponents(game_state)
                   if not game_state.get_agent_state(i).is_pacman]
         feasting = bool(scared) and min(scared) > home_dist + self.SCARED_MARGIN
+
+        if self.SHORT_FEAST:
+            cap = carry_limit or self.CARRY_LIMIT
+            if (carry_limit is None and self.get_score(game_state) > 0
+                    and my_moves_left <= 40):
+                cap = 5
+            carry_limit = cap
+            if feasting and carrying >= cap:
+                nearby = min(food if targets is None else targets,
+                             key=lambda cell: self.get_maze_distance(my_pos, cell), default=None)
+                if nearby is None:
+                    feasting = False
+                else:
+                    distance = self.get_maze_distance
+                    escape = min(distance(nearby, border) for border in self.home_border)
+                    trip = distance(my_pos, nearby) + escape
+                    feasting = (carrying < cap + 3 and distance(my_pos, nearby) <= 2
+                                and trip + self.SCARED_MARGIN < min(min(scared), my_moves_left)
+                                and nearby not in self.dead_ends)
 
         go_home = carrying > 0 and (
             (carrying >= (carry_limit or self.CARRY_LIMIT) and not feasting)
@@ -545,12 +606,19 @@ class AStarAgent(CaptureAgent):
         my_pos = my_state.get_position()
         invaders = self.invaders(game_state)
 
-        if invaders:
+        crossing = self.intercept(game_state, my_pos) if self.INTERCEPT and not my_state.scared_timer else None
+        if crossing is not None:
+            goals = [crossing]
+        elif invaders:
             most = max(carrying for _, carrying, _ in invaders)
             targets = [cell for cell, carrying, _ in invaders if carrying == most]
             if my_state.scared_timer > 0:
                 # Shadow the invader from 2 cells away so we can pounce when the timer ends
                 goals = [cell for inv in targets for cell in self.cells_at_distance(inv, 2)]
+                if self.SMART_RAIDS and (not goals or any(goal in targets for goal in goals)):
+                    goals = [max(self.home_cells, key=lambda cell: (
+                        min(self.get_maze_distance(cell, inv) for inv, _, _ in invaders),
+                        -self.get_maze_distance(my_pos, cell)))]
             else:
                 goals = targets
         else:
@@ -562,6 +630,20 @@ class AStarAgent(CaptureAgent):
         if path is None:
             return self.safest_action(game_state, [])
         return self.first_step(game_state, path)
+
+    def intercept(self, state, origin):
+        if not self.is_home(origin):
+            return None
+        distance = self.get_maze_distance
+        for invader, carried, seen in sorted(self.invaders(state), key=lambda item: -item[1]):
+            if not seen or carried < 3 or not self.crossings:
+                continue
+            crossing = min(self.crossings, key=lambda cell: distance(invader, cell))
+            escape = distance(invader, crossing)
+            ours = distance(origin, crossing)
+            if 0 < escape <= 5 and ours < escape and ours <= distance(origin, invader):
+                return crossing
+        return None
 
     def guard_point(self, game_state):
         """
@@ -622,6 +704,15 @@ class AStarOffensiveAgent(AStarAgent):
         if not my_state.is_pacman and my_state.scared_timer == 0:
             # We are a ghost here, so an invader passing close by is a cheap catch. Only go for
             # one that cannot step back to its side before we reach it, or it just keeps us busy
+            if self.COVER_RAIDER:
+                teammate = next(i for i in self.get_team(game_state) if i != self.index)
+                if game_state.get_agent_state(teammate).is_pacman:
+                    invaders = self.invaders(game_state)
+                    distance = self.get_maze_distance
+                    if any((visible or load >= 2) and distance(my_pos, cell) <= 7
+                           for cell, load, visible in invaders):
+                        self.trail.clear()
+                        return self.defend(game_state)
             catchable = [cell for cell, _, visible in self.invaders(game_state)
                          if visible and self.get_maze_distance(my_pos, cell)
                          <= min(self.HELP_DIST, self.beliefs.to_their_border[cell])]
@@ -645,9 +736,12 @@ class AStarDefensiveAgent(AStarAgent):
 
     def register_initial_state(self, game_state):
         super().register_initial_state(game_state)
-        self.to_home_border = EnemyBeliefs.distances_from(self, self.home_border)
+        self.to_home_border = EnemyBeliefs.distances_from(self, self.crossings or self.home_border)
+        self.raid_goal = None
 
     def choose_action(self, game_state):
+        if self.SMART_RAIDS:
+            return self.switch_roles(game_state)
         if not self.invaders(game_state):
             targets = self.raid_targets(game_state)
             if targets:
@@ -655,6 +749,84 @@ class AStarDefensiveAgent(AStarAgent):
         if game_state.get_agent_state(self.index).is_pacman:
             return self.retreat(game_state)
         return self.defend(game_state)
+
+    def switch_roles(self, state):
+        mine = state.get_agent_state(self.index)
+        origin = mine.get_position()
+        distance = self.get_maze_distance
+        if self.invaders(state):
+            self.raid_goal = None
+            return self.retreat(state) if mine.is_pacman else self.defend(state)
+
+        teammate = next(i for i in self.get_team(state) if i != self.index)
+        partner = state.get_agent_state(teammate)
+        moves_left = (state.data.timeleft + state.get_num_agents() - 1) // state.get_num_agents()
+        score = self.get_score(state)
+        raid_limit = 2 if score > 0 and moves_left < 65 else self.RAID_CARRY
+        if mine.is_pacman and (mine.num_carrying >= raid_limit or moves_left <= 8):
+            self.raid_goal = None
+            return self.retreat(state)
+
+        food = self.get_food(state).as_list()
+        far = float('inf')
+        blockers = [i for i in self.get_opponents(state)
+                    if not state.get_agent_state(i).is_pacman]
+        watched = [i for i in blockers if i in self.beliefs.attackers] or blockers
+        entry = far
+        for i in watched:
+            current = state.get_agent_position(i)
+            if current is not None:
+                entry = min(entry, self.to_home_border.get(current, far))
+            else:
+                near = sorted(self.beliefs.dist[i].items(),
+                              key=lambda item: self.to_home_border.get(item[0], far))
+                probability = 0
+                for cell, mass in near:
+                    probability += mass
+                    if probability >= 0.35:
+                        entry = min(entry, self.to_home_border.get(cell, far))
+                        break
+
+        # If the other agent is home and active, a slightly longer raid can be covered.
+        cover = not partner.is_pacman and not partner.scared_timer
+        slack = 5 if cover and self.PRESSURE else 2 if cover else 0
+        if score > 0 and moves_left < 55:
+            slack -= 2
+        if entry <= (3 if self.PRESSURE else 4):
+            self.raid_goal = None
+            return self.retreat(state) if mine.is_pacman else self.defend(state)
+
+        ghosts = self.dangerous_ghosts(state)
+        cost = self.ghost_cost(ghosts)
+        partner_pos = partner.get_position()
+        near_food = sorted(food, key=lambda target: (distance(origin, target), target))[:6]
+        if self.raid_goal in food and self.raid_goal not in near_food:
+            near_food.append(self.raid_goal)
+        plans = []
+        for target in near_food:
+            back = self.to_home_border.get(target, far)
+            if back > self.RAID_RANGE or target in self.dead_ends:
+                continue
+            eta = distance(origin, target)
+            if back + eta + 1 > min(moves_left, entry + slack):
+                continue
+            if any(weight >= 0.15 and distance(ghost, target) <= min(3, eta + 1)
+                   for ghost, weight in ghosts):
+                continue
+            nearby = sum(distance(target, other) <= 2 for other in near_food)
+            overlap = (partner.is_pacman and distance(partner_pos, target) <= min(2, eta))
+            value = 1 + 0.22 * min(3, nearby) - 0.13 * (eta + back) - 0.75 * overlap
+            value += 0.30 * (target == self.raid_goal)
+            plans.append((value, target))
+        for _, target in sorted(plans, reverse=True)[:2]:
+            path = self.a_star(origin, [target], cost)
+            back = self.a_star(target, self.crossings or self.home_border, cost)
+            if path and back and len(path) + len(back) + 1 <= min(moves_left, entry + slack):
+                self.raid_goal = target
+                return self.first_step(state, path)
+
+        self.raid_goal = None
+        return self.retreat(state) if mine.is_pacman else self.defend(state)
 
     def raid_targets(self, game_state):
         """Food worth raiding, or [] if raiding is unsafe right now."""
