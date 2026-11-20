@@ -238,6 +238,7 @@ class AStarAgent(CaptureAgent):
     CARRY_LIMIT = 6      # food carried before heading home
     GHOST_ALERT = 5      # maze distance at which a ghost counts as a threat
     TIME_MARGIN = 10     # spare moves kept when racing the clock home
+    SCARED_MARGIN = 4    # spare moves kept when racing the end of the enemy's scared time home
 
     def __init__(self, index, time_for_computing=.1):
         super().__init__(index, time_for_computing)
@@ -435,9 +436,10 @@ class AStarAgent(CaptureAgent):
     # Attacking #
     #############
 
-    def attack(self, game_state):
+    def attack(self, game_state, carry_limit=None, targets=None):
         """
         Collect food on the enemy side and bank it before it gets risky.
+        carry_limit and targets override CARRY_LIMIT and the food to go for (raids).
         Goal priority:
           1. finish a detour, if we got stuck (see pick_detour)
           2. go home if time is running out, the bag is full, or a ghost is close
@@ -474,8 +476,14 @@ class AStarAgent(CaptureAgent):
         home_dist = min(self.get_maze_distance(my_pos, b) for b in self.home_border)
         my_moves_left = game_state.data.timeleft // 4
 
+        # After a capsule, keep eating past CARRY_LIMIT while every enemy ghost stays
+        # scared long enough for us to still get home
+        scared = [game_state.get_agent_state(i).scared_timer for i in self.get_opponents(game_state)
+                  if not game_state.get_agent_state(i).is_pacman]
+        feasting = bool(scared) and min(scared) > home_dist + self.SCARED_MARGIN
+
         go_home = carrying > 0 and (
-            carrying >= self.CARRY_LIMIT
+            (carrying >= (carry_limit or self.CARRY_LIMIT) and not feasting)
             or home_dist + self.TIME_MARGIN >= my_moves_left
             or len(food) <= 2
             or threatened)
@@ -490,7 +498,7 @@ class AStarAgent(CaptureAgent):
         if go_home:
             path = self.a_star(my_pos, self.home_border, cost)
         else:
-            path = self.a_star(my_pos, food, cost)
+            path = self.a_star(my_pos, food if targets is None else targets, cost)
             if path is None:  # food unreachable, at least stay safe
                 path = self.a_star(my_pos, self.home_border, cost)
 
@@ -625,7 +633,44 @@ class AStarOffensiveAgent(AStarAgent):
 
 
 class AStarDefensiveAgent(AStarAgent):
-    """Defends."""
+    """
+    Defends, but raids food near the border while no enemy is on our side or
+    close to it. Enemies stay flagged as Pacmen even when hidden, so it knows the
+    moment one crosses and runs back home.
+    """
+
+    RAID_RANGE = 8       # only food within this many steps of our border
+    RAID_CARRY = 3       # food carried before heading home on a raid
+    RAID_ALERT = 6       # no raid while a watched enemy is this close to our border
+
+    def register_initial_state(self, game_state):
+        super().register_initial_state(game_state)
+        self.to_home_border = EnemyBeliefs.distances_from(self, self.home_border)
 
     def choose_action(self, game_state):
+        if not self.invaders(game_state):
+            targets = self.raid_targets(game_state)
+            if targets:
+                return self.attack(game_state, carry_limit=self.RAID_CARRY, targets=targets)
+        if game_state.get_agent_state(self.index).is_pacman:
+            return self.retreat(game_state)
         return self.defend(game_state)
+
+    def raid_targets(self, game_state):
+        """Food worth raiding, or [] if raiding is unsafe right now."""
+        ghosts = [i for i in self.get_opponents(game_state) if not game_state.get_agent_state(i).is_pacman]
+        watched = [i for i in ghosts if i in self.beliefs.attackers] or ghosts
+        for i in watched:
+            if self.to_home_border.get(self.enemy_cell(game_state, i), 0) <= self.RAID_ALERT:
+                return []
+        return [f for f in self.get_food(game_state).as_list()
+                if self.to_home_border.get(f, float('inf')) <= self.RAID_RANGE]
+
+    def retreat(self, game_state):
+        """Back to our side, avoiding ghosts."""
+        my_pos = game_state.get_agent_position(self.index)
+        ghosts = self.dangerous_ghosts(game_state)
+        path = self.a_star(my_pos, self.home_border, self.ghost_cost(ghosts))
+        if path is None:
+            return self.safest_action(game_state, [g for g, weight in ghosts if weight == 1.0])
+        return self.first_step(game_state, path)
