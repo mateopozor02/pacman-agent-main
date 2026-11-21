@@ -262,6 +262,11 @@ class AStarAgent(CaptureAgent):
     # Endgame: with this many moves left, the score decides the roles (see endgame)
     ENDGAME_MOVES = 75
 
+    # Trapping a single invader between both agents (see team_duty)
+    TRAP_RANGE = 12      # the attacker joins when the invader is at most this many steps away...
+    TRAP_LOAD = 2        # ...or carries at least this many dots
+    BLOCK_POUNCE = 2     # the blocker leaves its crossing for an invader this close
+
     def __init__(self, index, time_for_computing=.1):
         super().__init__(index, time_for_computing)
         self.start = None
@@ -629,10 +634,68 @@ class AStarAgent(CaptureAgent):
                  game_state.get_agent_position(i) is not None)
                 for i in self.get_opponents(game_state) if game_state.get_agent_state(i).is_pacman]
 
+    def team_duty(self, game_state):
+        """
+        Who handles the invaders when both of our agents are ghosts on our side.
+        If only the defender is scared, the attacker chases the invader carrying
+        the most (under the same TRAP_RANGE / TRAP_LOAD condition as below).
+        With neither scared, roles follow distance, not the agent's class:
+          - one invader: the closer agent chases it, the other blocks the
+            crossing nearest to it, so the invader is caught between the two
+            (the blocker pounces when the invader comes within BLOCK_POUNCE).
+            The attacker only joins when the invader is within TRAP_RANGE of it
+            or carries at least TRAP_LOAD dots; otherwise the defender is alone
+          - two invaders: each agent chases one, paired so the longer of the
+            two chases is as short as possible
+        Returns {agent index: goal cells}; empty when the team is not in that
+        situation (the agents then follow their own rules). Both agents compute
+        it from the game state, so they agree without talking.
+        """
+        team = self.get_team(game_state)
+        states = {i: game_state.get_agent_state(i) for i in team}
+        if any(s.is_pacman for s in states.values()) or self.endgame(game_state) == 'all_in':
+            return {}
+        invaders = self.invaders(game_state)
+        if not invaders:
+            return {}
+        dist = self.get_maze_distance
+        pos = {i: states[i].get_position() for i in team}
+        other = next(i for i in team if i != self.index)
+        defender, attacker = (self.index, other) if isinstance(self, AStarDefensiveAgent) else (other, self.index)
+
+        if states[attacker].scared_timer:
+            return {}
+        if states[defender].scared_timer:
+            # The defender cannot touch invaders now, so the attacker takes the chase
+            target, load, _ = max(invaders, key=lambda inv: (inv[1], -dist(pos[attacker], inv[0])))
+            near = dist(pos[attacker], target) <= self.TRAP_RANGE
+            return {attacker: [target]} if near or load >= self.TRAP_LOAD else {}
+
+        if len(invaders) >= 2:
+            (a, _, _), (b, _, _) = invaders[:2]
+            straight = max(dist(pos[defender], a), dist(pos[attacker], b))
+            crossed = max(dist(pos[defender], b), dist(pos[attacker], a))
+            if crossed < straight:
+                a, b = b, a
+            return {defender: [a], attacker: [b]}
+
+        cell, load, _ = invaders[0]
+        if dist(pos[attacker], cell) > self.TRAP_RANGE and load < self.TRAP_LOAD:
+            return {}
+        # The closer agent chases; on a tie the defender does, so the attacker keeps its place
+        chaser = attacker if dist(pos[attacker], cell) < dist(pos[defender], cell) else defender
+        blocker = defender if chaser == attacker else attacker
+        if dist(pos[blocker], cell) <= self.BLOCK_POUNCE:
+            block = [cell]
+        else:
+            block = [min(self.crossings or self.home_border, key=lambda c: (dist(cell, c), c))]
+        return {chaser: [cell], blocker: block}
+
     def defend(self, game_state):
         """
         Guard our food without leaving our side.
         Goal priority:
+          0. our part of the team plan when both agents are home (see team_duty)
           1. block the crossing a loaded invader is about to escape through, if
              we get there first (see intercept; not while scared)
           2. chase invaders: their exact cell if visible, else their most likely
@@ -645,8 +708,11 @@ class AStarAgent(CaptureAgent):
         my_pos = my_state.get_position()
         invaders = self.invaders(game_state)
 
-        crossing = None if my_state.scared_timer else self.intercept(game_state, my_pos)
-        if crossing is not None:
+        duty = self.team_duty(game_state).get(self.index)
+        crossing = None if my_state.scared_timer or duty else self.intercept(game_state, my_pos)
+        if duty:
+            goals = duty
+        elif crossing is not None:
             goals = [crossing]
         elif invaders:
             most = max(carrying for _, carrying, _ in invaders)
@@ -743,6 +809,7 @@ class AStarAgent(CaptureAgent):
 class AStarOffensiveAgent(AStarAgent):
     """
     Attacks. While it is still on our side as a ghost, it first helps at home:
+    it chases or blocks an invader together with the defender (see team_duty),
     it defends when an invader is close and the defender is out raiding or
     facing a second invader, and it eats an invader that is close by and cannot
     step back to its side first. When ahead in the endgame it goes home and
@@ -760,6 +827,10 @@ class AStarOffensiveAgent(AStarAgent):
             self.trail.clear()
             return self.retreat(game_state) if my_state.is_pacman else self.defend(game_state)
         if not my_state.is_pacman and my_state.scared_timer == 0:
+            if self.index in self.team_duty(game_state):
+                # Both of us are home: chase or block the invader with the defender
+                self.trail.clear()
+                return self.defend(game_state)
             teammate = next(i for i in self.get_team(game_state) if i != self.index)
             invaders = self.invaders(game_state)
             if game_state.get_agent_state(teammate).is_pacman or len(invaders) > 1:
