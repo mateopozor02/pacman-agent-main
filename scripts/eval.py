@@ -17,12 +17,15 @@ Opponent pool: play each listed team against a fixed set of opponents only
     python scripts/eval.py mateo mateo@HEAD~1 --pool    # new version vs previous commit
     python scripts/eval.py mateo mateo@origin/main --pool  # vs the version merged on GitHub
     python scripts/eval.py mateo --pool rush turtle     # vs a custom pool
+    python scripts/eval.py mateo --pool prev            # vs every previous-edition team
 
 Team shortcuts:
     baseline      -> pacman-contest/src/contest/baseline_team.py
     <opponent>    -> scripts/opponents/<opponent>.py:
                      rush (two baseline attackers), turtle (two baseline defenders),
                      mateo_raid (Mateo's agent as merged in PR #2)
+    prev/<team>   -> scripts/opponents/prev/<team>.py: teams from previous editions
+    --pool prev   -> every team in scripts/opponents/prev (see its README)
     main          -> my_team.py (the submission)
     <name>        -> agents/<name>/my_team.py
     <name>/<file> -> agents/<name>/<file>.py
@@ -52,6 +55,7 @@ DEFAULT_LAYOUTS = ['defaultCapture', 'alleyCapture', 'bloxCapture', 'crowdedCapt
 
 
 OPPONENTS_DIR = os.path.join(ROOT, 'scripts', 'opponents')
+PREV_DIR = os.path.join(OPPONENTS_DIR, 'prev')
 DEFAULT_POOL = ['baseline', 'rush', 'turtle', 'mateo_raid', 'caspar/hybrid', 'caspar/strategic_v3']
 _snapshot_dir = None  # temporary folder for files checked out by <team>@<rev>, created on first use
 
@@ -111,6 +115,10 @@ def resolve_team(team):
 def play_game(job):
     """Runs one game in this worker process. Returns a result dict."""
     red, blue, red_path, blue_path, layout, length = job
+    # Older teams import framework modules without the package prefix (from game import ...);
+    # capture.py run directly finds them because its folder is on sys.path, so do the same here
+    if CONTEST_DIR not in sys.path:
+        sys.path.insert(0, CONTEST_DIR)
     import contest.capture as capture
 
     os.chdir(CONTEST_DIR)  # layouts are looked up relative to the working directory
@@ -135,6 +143,17 @@ def play_game(job):
         'seconds': time.time() - start,
         'error': None,
     }
+
+
+def expand_pool(names):
+    """Replaces the group name 'prev' with every team in scripts/opponents/prev."""
+    result = []
+    for name in names:
+        if name == 'prev':
+            result += sorted('prev/' + f[:-3] for f in os.listdir(PREV_DIR) if f.endswith('.py'))
+        else:
+            result.append(name)
+    return list(dict.fromkeys(result))
 
 
 def build_jobs(pairs, paths, layouts, length):
@@ -236,12 +255,12 @@ def main():
                         help='parallel games (keep below CPU count so timing stays realistic)')
     parser.add_argument('--pool', nargs='*', default=None,
                         help='play the teams only against these opponents '
-                             f'(no names: {" ".join(DEFAULT_POOL)})')
+                             f'(no names: {" ".join(DEFAULT_POOL)}; prev: every previous-edition team)')
     args = parser.parse_args()
 
     opponents = None
     if args.pool is not None:
-        opponents = args.pool or [o for o in DEFAULT_POOL if '@' in o or os.path.exists(team_path(o))]
+        opponents = expand_pool(args.pool) or [o for o in DEFAULT_POOL if '@' in o or os.path.exists(team_path(o))]
         missing = [o for o in DEFAULT_POOL if not args.pool and o not in opponents]
         if missing:
             print(f'Skipping pool opponents not found locally: {", ".join(missing)}')
