@@ -247,6 +247,8 @@ class AStarAgent(CaptureAgent):
     TIME_MARGIN = 10     # spare moves kept when racing the clock home
     SCARED_MARGIN = 4    # spare moves kept when racing the end of the enemy's scared time home
 
+    ARRIVE_MARGIN = 1    # target food we reach at least this many steps before any ghost (see safe_food)
+
     # Feasting: past the carry limit while enemy ghosts are scared (see attack)
     FEAST_REACH = 2      # only food at most this many steps away is worth the extra risk
     FEAST_EXTRA = 3      # at most this many dots beyond the carry limit
@@ -353,7 +355,7 @@ class AStarAgent(CaptureAgent):
         """
         Dead ends on the enemy side: repeatedly remove cells with a single open
         neighbour; the removed cells are corridors with one way out. Returns
-        {cell: (exit cell, steps to the exit)}; callers only test membership.
+        {cell: (exit cell, steps to the exit)}.
         """
         remaining = {cell: {nxt for _, nxt in self.neighbors(cell)}
                      for cell in self.walls.as_list(False) if not self.is_home(cell)}
@@ -600,13 +602,46 @@ class AStarAgent(CaptureAgent):
         if go_home:
             path = self.a_star(my_pos, self.home_border, cost)
         else:
-            path = self.a_star(my_pos, food, cost)
+            path = self.a_star(my_pos, self.safe_food(game_state, my_pos, food), cost)
             if path is None:  # food unreachable, at least stay safe
                 path = self.a_star(my_pos, self.home_border, cost)
 
         if path is None:
             return self.safest_action(game_state, visible)
         return self.first_step(game_state, path)
+
+    def safe_food(self, game_state, my_pos, food):
+        """
+        Where to look for food: the dots we reach at least ARRIVE_MARGIN steps
+        before every enemy ghost that can eat us; for a dot in a dead end, we
+        must also get back to the dead end's exit before any ghost gets there.
+        Ghosts count at their cell if seen, otherwise at their most likely cell,
+        so a ghost stepping in and out of sight range does not flip the choice
+        (which made the attacker step across the border and back every turn).
+        If no dot qualifies, all of them.
+        """
+        dist = self.get_maze_distance
+        ghosts = []
+        for i in self.get_opponents(game_state):
+            enemy = game_state.get_agent_state(i)
+            if enemy.is_pacman:
+                continue
+            cell = self.enemy_cell(game_state, i)
+            if enemy.scared_timer > dist(my_pos, cell) + 1:
+                continue  # stays scared until we could reach it
+            ghosts.append(cell)
+        if not ghosts or not food:
+            return food
+        lead = {}  # dot -> how many steps sooner than any ghost we get there (and out of its dead end)
+        for dot in food:
+            mine = dist(my_pos, dot)
+            lead[dot] = min(dist(g, dot) for g in ghosts) - mine
+            if dot in self.dead_ends:
+                exit_cell, depth = self.dead_ends[dot]
+                lead[dot] = min(lead[dot], min(dist(g, exit_cell) for g in ghosts) - mine - depth)
+        # With nothing safe, every dot stays a candidate: steering for the least
+        # contested one made the attacker walk in and back out over and over
+        return [dot for dot in food if lead[dot] >= self.ARRIVE_MARGIN] or food
 
     def pick_detour(self, game_state, my_pos, capsules):
         """
