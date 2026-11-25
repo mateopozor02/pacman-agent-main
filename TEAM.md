@@ -12,9 +12,9 @@
 
 * Student 1's Student number - Full Name - Student email - Student Github id
 
-* U283349 - Caspar Schlageter -caspar.schlageter01@estudiant.upf.edu - TLCasparS
-* Mateo Pozo - - mateopozor02
-* Nikita B
+* U283349 - Caspar Schlageter - caspar.schlageter01@estudiant.upf.edu - TLCasparS
+* U283346 - Mateo Pozo - mateonicolas.pozo01@estudiant.upf.edu - mateopozor02
+* U283401 - Nikita Bogdanov - 
 
 Replace the lines above with the correct details of members. Delete or add lines as needed.
 
